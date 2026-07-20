@@ -5,8 +5,11 @@
 > Built with PySceneDetect, faster-whisper, FFmpeg, and LLM scoring (Yandex AI Studio DeepSeek V4 / Gemini).
 
 ![Status](https://img.shields.io/badge/status-stable-green)
-![Python](https://img.shields.io/badge/python-3.9--3.11-blue)
+![Python](https://img.shields.io/badge/python-3.9%20|%203.10%20|%203.11-3776AB?logo=python&logoColor=white)
+![FFmpeg](https://img.shields.io/badge/ffmpeg-required-007ACC?logo=ffmpeg&logoColor=white)
+![Platform](https://img.shields.io/badge/platform-Windows-0078D4?logo=windows&logoColor=white)
 ![License](https://img.shields.io/badge/license-MIT-green)
+![Release](https://img.shields.io/github/v/release/zhistokoepvpp-ctrl/MovieShort-AI)
 
 ---
 

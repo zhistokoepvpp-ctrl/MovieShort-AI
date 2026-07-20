@@ -1,0 +1,29 @@
+# Auto-detect text files and normalize line endings
+* text=auto
+
+# Bat files should stay CRLF (Windows)
+*.bat text eol=crlf
+
+# Source files with LF (for consistency)
+*.py text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.xml text eol=lf
+
+# Binary files
+*.png binary
+*.jpg binary
+*.mp4 binary
+*.avi binary
+*.mkv binary
+*.mov binary
+*.wav binary
+*.mp3 binary
+*.srt binary
+*.ass binary
+*.onnx binary
+*.bin binary
+*.pt binary
+*.pth binary
