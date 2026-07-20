@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Environment
+venv/
+.venv/
+env/
+
+# Output files (generated clips)
+output/*
+!output/.gitkeep
+
+# Media files (large)
+*.mp4
+*.avi
+*.mkv
+*.mov
+*.wav
+*.mp3
+
+# Subtitle files
+*.srt
+*.ass
+
+# User config (contains API keys)
+user_config.json
+
+# Models (large binary files)
+models/*.onnx
+models/*.bin
+models/*.pt
+models/*.pth
+
+# Temp files
+*.tmp
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
