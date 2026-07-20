@@ -8,7 +8,23 @@
 ![Python](https://img.shields.io/badge/python-3.9--3.11-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-## Features
+---
+
+<p align="center">
+  <b>🌐 English</b> &nbsp;|&nbsp; <a href="#русский">Русский</a>
+</p>
+
+---
+
+## English
+
+**MovieShort AI** automatically extracts the best moments from full-length movies and prepares them for YouTube Shorts:
+
+- Scene detection → transcription → LLM scoring → vertical crop → subtitles
+- AI-powered clip selection with knowledge-aware scoring (1-10)
+- Fully automated pipeline — just select a movie and pick the best clips
+
+### Features
 
 - **Smart scene detection** — PySceneDetect finds scene boundaries, merges short scenes, splits by dialogue pauses
 - **AI-powered clip selection** — LLM (DeepSeek / Gemini) scores each scene (1-10) with names, uses knowledge about the movie
@@ -21,7 +37,7 @@
 - **Bilingual interface** — English and Russian UI, translatable LLM prompts
 - **Anti-copyright mode** — Horizontal flip + contrast correction to avoid Content ID flags
 
-## Quick Start
+### Quick Start
 
 ```bash
 # 1. Install (one-time)
@@ -33,23 +49,23 @@ run.bat
 
 Opens at `http://localhost:7860`.
 
-### Prerequisites
+#### Prerequisites
 
 - **Python 3.9–3.11**
-- **FFmpeg** (auto-installed via `setup.bat` using winget, or manual download)
+- **FFmpeg** (auto-installed via `setup.bat`)
 - **NVIDIA GPU** (optional, speeds up transcription 5-10x)
 
-## Interface
+### Interface
 
-### Modes
+#### Modes
 
 | Mode | Description |
 |------|-------------|
-| **Contextual (LLM)** | Default. LLM receives all scenes with transcription and selects the best ones by score (1-10) with names. No scene matching needed. |
+| **Contextual (LLM)** | Default. LLM receives all scenes with transcription and selects the best ones by score (1-10) with names. |
 | **Standard (no LLM)** | Random scene selection. No API key required. No clip names generated. |
 | **Manual** | Enter custom timestamps — clips are cut exactly at those points. |
 
-### Editing Options
+#### Editing Options
 
 | Option | Default | Description |
 |--------|---------|-------------|
@@ -57,139 +73,176 @@ Opens at `http://localhost:7860`.
 | Smart centering | On | Face detection, centers frame on active area |
 | Banner areas | On | Top/bottom padding for banners (300px configurable) |
 | Blurred background | On | Fills empty space with blurred video |
-| Anti-copyright | On | Mirror + contrast adjustment for Content ID avoidance |
+| Anti-copyright | On | Mirror + contrast for Content ID avoidance |
 
-### Subtitle Editor (Settings > Subtitle Editor)
+### Setup
 
-Customize font, size (8-48px), color (6 options), outline (0-5), bold/italic/shadow, bottom margin (50-800px). **Live preview** updates in real time.
-
-## Configuration
-
-### config.py
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `BANNER_TOP` | 300 px | Top banner padding |
-| `BANNER_BOTTOM` | 300 px | Bottom banner padding |
-| `FACE_TRACKING_INTERVAL` | 5 | Analyze every Nth frame |
-| `WHISPER_MODEL` | medium | tiny/base/small/medium/large-v3 |
-| `WHISPER_BEAM_SIZE` | 5 | Transcription quality |
-| `SCENE_THRESHOLD` | 27.0 | Scene detector sensitivity |
-| `MIN_SCENE_DURATION` | 15s | Minimum scene duration after merge |
-| `MAX_MERGE_DURATION` | 120s | Maximum merge duration |
-| `DIALOGUE_PAUSE_THRESHOLD` | 2s | Pause >2s creates scene boundary |
-| `DEFAULT_MIN_CLIP_DURATION` | 15s | Minimum clip length |
-| `DEFAULT_MAX_CLIP_DURATION` | 60s | Maximum clip length |
-| `VERTICAL_WIDTH` | 1080 | Output video width |
-| `VERTICAL_HEIGHT` | 1920 | Output video height |
-
-## Setup
-
-### Yandex AI Studio (recommended)
+#### Yandex AI Studio (recommended)
 
 1. Get an API key from [Yandex AI Studio](https://console.cloud.yandex.com/folders)
-2. Go to **Settings** in the app
-3. Provider: **Yandex AI Studio**
-4. Enter **API Key** and **Folder ID**
-5. Select model (e.g., `deepseek-v4-flash`)
-6. Click **Verify key** — green = ready
+2. Go to **Settings** in the app → Provider: **Yandex AI Studio**
+3. Enter **API Key** and **Folder ID**, select model (e.g., `deepseek-v4-flash`)
+4. Click **Verify key**
 
-### Gemini
+#### Gemini
 
 1. Get an API key from [Google AI Studio](https://aistudio.google.com/apikey)
-2. Go to **Settings** > **Gemini**
-3. Paste the API key — the app auto-detects OpenRouter or Google AI
+2. Go to **Settings** > **Gemini** and paste the key
 
-### GPU Acceleration
+### Pipeline
 
-During `setup.bat`, you will be asked: *"Install PyTorch with CUDA? [Y/N]"*
+1. **Scene detection** — PySceneDetect finds boundaries by frame changes
+2. **Short scene merging** — Buffer algorithm merges short scenes (max 120s)
+3. **Transcription** — faster-whisper (medium) once for the full movie
+4. **Pause splitting** — Scenes split at dialogue pauses >2s
+5. **LLM scoring** — Batch by 30 scenes, score 1-10 with names
+6. **Clip selection** — Score ≥ 7, max 20 clips, diversity filter
+7. **FFmpeg processing** — Cut → 9:16 crop → subtitles → blurred background → 1080×1920
 
-- **Y** > Installs PyTorch with CUDA 12.4 (requires NVIDIA GPU)
-- **N** > Installs CPU-only version (slower transcription)
+### License
 
-Verify: run `run.bat` — the log will show `GPU detected: ...` or `CUDA not found`.
+[MIT](LICENSE) — free to use, modify, and distribute.
 
-## Pipeline
+---
 
-1. **Scene detection** — PySceneDetect finds boundaries by frame changes (with progress bar)
-2. **Short scene merging** — Buffer algorithm merges short scenes into meaningful segments (max 120s)
-3. **Transcription** — faster-whisper recognizes speech once for the full movie; word-level timestamps; GPU auto-detection
-4. **Pause splitting** — Scenes split at dialogue pauses >2s (continuous conversation per scene)
-5. **LLM scoring** — Batch by 30 scenes; model scores each (1-10) with a name; knowledge-aware prompts
-6. **Clip selection** — Score >= threshold (default 7), max 20 clips; diversity filter distributes across movie
-7. **Processing** — FFmpeg: cut > 9:16 crop > subtitles > blurred background > full 1080x1920 frame
+## Русский
 
-## Technical Details
+**MovieShort AI** — автоматическая нарезка фильмов на YouTube Shorts. Интеллектуально извлекает лучшие моменты из полнометражных фильмов, обрезает их в вертикальный формат 9:16, добавляет субтитры и готовит к публикации.
 
-### Video Output
+> Сделано с PySceneDetect, faster-whisper, FFmpeg и скорингом через LLM (Yandex AI Studio DeepSeek V4 / Gemini).
 
-- **Full frame** — Original 16:9 video scaled to 1080x1320 (content area)
-- **Blurred background** (toggle) — Content area overlaid on blurred full-frame background (1080x1920)
-- **Banner areas** (toggle, configurable) — Top/bottom padding for YouTube Shorts banners
-- **Anti-copyright** (toggle) — Horizontal flip + contrast/brightness adjustment
+### Возможности
 
-### Subtitle Pipeline
+- **Умный поиск сцен** — PySceneDetect находит границы сцен, объединяет короткие, делит по паузам в диалогах
+- **AI-выбор клипов** — LLM (DeepSeek / Gemini) оценивает каждую сцену (1-10) и даёт название, используя знания о фильме
+- **Face tracking** — OpenCV находит лица, центрирует кадр по самой активной области
+- **Вертикальный кроп (9:16)** — Профессиональный формат YouTube Shorts с размытым фоном
+- **Субтитры по словам** — faster-whisper с таймстемпами на уровне слов; шрифт, размер, цвет, положение настраиваются
+- **Пакетная обработка** — Несколько фильмов подряд с полным отслеживанием прогресса
+- **Smart centering** — Для длинных сцен находит окно с максимальной плотностью диалога
+- **Diversity-фильтр** — Равномерно распределяет клипы по всему фильму
+- **Двуязычный интерфейс** — Русский и английский язык интерфейса, промпты LLM на языке фильма
+- **Anti-copyright** — Зеркало + коррекция контраста для обхода Content ID
 
-- **Word-group SRT** — Groups 2-4 words per line, no line breaks
-- **Above banner** — Subtitles raised by `position_y` px from bottom
-- **Precise sync** — Word-level Whisper timestamps
-- **Full movie transcription** — Done once, cached as JSON, reused for all clips
+### Быстрый старт
 
-### Smart Centering
+```bash
+# 1. Установка (один раз)
+setup.bat
 
-For long scenes (>60s), the algorithm finds the window with maximum word density — the clip starts at the most dialogue-rich section, not at scene start. Sliding window step: 1s.
+# 2. Запуск
+run.bat
+```
 
-### GPU Auto-detection
+Откроется `http://localhost:7860`.
 
-On Whisper startup:
-1. Checks CUDA availability
-2. Tries compute types: `float16` > `int8_float16` > CPU `int8`
-3. Prints GPU model and estimated transcription time
+#### Зависимости
 
-### Scene Merging (No Snowball)
+- **Python 3.9–3.11**
+- **FFmpeg** (установится автоматически через `setup.bat`)
+- **NVIDIA GPU** (опционально, ускоряет транскрипцию в 5-10×)
 
-Buffer algorithm: short scenes (<15s) merge but never expand an already-formed scene. Dialogue pauses >2s create scene boundaries. Result: meaningful 15-120s fragments instead of giant 400s scenes.
+### Интерфейс
 
-### Pinned Versions (requirements.txt)
+#### Режимы работы
 
-- **gradio 4.44.1** — Stable, tested compatibility
-- **gradio_client 1.3.0** — Compatible with gradio 4.x
-- **huggingface_hub 0.22.2** — Last version with HfFolder
-- **scenedetect <1.0** — API 0.6.x differs from 1.x
+| Режим | Описание |
+|-------|----------|
+| **Контекстный (LLM)** | По умолчанию. LLM получает все сцены с транскрипцией и сама выбирает лучшие по оценке (1-10) с названиями. |
+| **Стандартный (без LLM)** | Случайный выбор сцен. Не требует API-ключа. Названия не генерируются. |
+| **Ручной** | Укажи таймкоды — программа нарежет клипы по ним. |
 
-### Monkey-patch (main.py)
+#### Опции монтажа
 
-`gradio_client==1.3.0` has a bug: if JSON Schema contains `additionalProperties: false`, the parser crashes with `TypeError: argument of type 'bool' is not iterable`. `main.py` contains a monkey-patch that fixes this before importing Gradio.
+| Опция | По умолч. | Описание |
+|-------|-----------|----------|
+| Субтитры | Вкл | Распознавание речи + наложение субтитров |
+| Smart centering | Вкл | Детекция лиц, центровка кадра |
+| Баннерные поля | Вкл | Поля сверху/снизу для баннеров (300px) |
+| Размытый фон | Вкл | Заполняет пустое пространство размытым видео |
+| Anti-copyright | Вкл | Зеркало + контраст для обхода Content ID |
 
-## Project Structure
+### Настройка
+
+#### Yandex AI Studio (рекомендуется)
+
+1. Получи ключ: [Yandex AI Studio](https://console.cloud.yandex.com/folders) → создать сервисный аккаунт
+2. В интерфейсе: **Settings** → провайдер **Yandex AI Studio**
+3. Введи **API Key**, **Folder ID**, выбери модель (например, `deepseek-v4-flash`)
+4. Нажми **Verify key** — зелёный = работает
+
+#### Gemini
+
+1. Получи ключ: [Google AI Studio](https://aistudio.google.com/apikey)
+2. Вставь API-ключ в **Settings** > **Gemini** — приложение само определит OpenRouter или Google AI
+
+### Пайплайн обработки
+
+1. **Детекция сцен** — PySceneDetect находит границы сцен по изменению кадра
+2. **Слияние коротких сцен** — Буферный алгоритм объединяет короткие сцены (макс. 120с)
+3. **Транскрипция** — faster-whisper (medium) распознаёт речь 1 раз для всего фильма
+4. **Разбивка по паузам** — Сцены делятся по паузам в диалоге >2с
+5. **LLM скоринг** — Батчами по 30 сцен; оценка 1-10 + название
+6. **Выбор клипов** — Оценка ≥ 7, макс. 20 клипов, diversity-фильтр
+7. **FFmpeg обработка** — Нарезка → кроп 9:16 → субтитры → размытый фон → 1080×1920
+
+### Структура проекта
 
 ```
 MovieShort-AI/
-├── main.py              # Entry point (+ gradio_client monkey-patch)
-├── config.py            # Configuration (Whisper, FFmpeg, API, banners)
+├── main.py              # Точка входа (+ monkey-patch gradio_client)
+├── config.py            # Конфигурация (Whisper, FFmpeg, API, баннеры)
 ├── core/
-│   ├── pipeline.py      # Single clip processing pipeline
-│   ├── processor.py     # Face tracking + vertical crop
-│   ├── batch.py         # Batch movie processing
-│   └── subtitle.py      # SRT generation (word-group, JSON persistence)
+│   ├── pipeline.py      # Пайплайн обработки одного клипа
+│   ├── processor.py     # Face tracking + вертикальный кроп
+│   ├── batch.py         # Пакетная обработка фильма
+│   └── subtitle.py      # Генерация SRT (word-group, JSON persistence)
 ├── analyzers/
-│   ├── detector.py      # Standard mode (no LLM)
-│   ├── scene_analyzer.py# Scene detection, merging, transcription
-│   └── text_analyzer.py # LLM analysis (prompts, API, parsing)
+│   ├── detector.py      # Стандартный режим (без LLM)
+│   ├── scene_analyzer.py# Детекция сцен, слияние, транскрипция
+│   └── text_analyzer.py # LLM анализ (промпты, API, парсинг)
 ├── gui/
-│   └── app.py           # Gradio web interface
+│   └── app.py           # Gradio веб-интерфейс
 ├── utils/
-│   ├── ffmpeg_utils.py  # FFmpeg commands
-│   ├── user_config.py   # Settings persistence
-│   └── log_capture.py   # Log capture for GUI
+│   ├── ffmpeg_utils.py  # FFmpeg команды
+│   ├── user_config.py   # Сохранение настроек
+│   └── log_capture.py   # Захват лога для GUI
 ├── models/
 │   └── haarcascade_frontalface_default.xml
-├── output/              # Generated clips (created automatically)
-├── requirements.txt     # Dependencies
-├── setup.bat           # Installation (venv + CUDA)
-└── run.bat             # Launch
+├── output/              # Выходные файлы (создаётся автоматически)
+├── requirements.txt     # Зависимости
+├── setup.bat           # Установка (venv + CUDA)
+└── run.bat             # Запуск
 ```
 
-## License
+### Технические детали
 
-[MIT](LICENSE) — free to use, modify, and distribute.
+#### Видео на выходе
+
+- **Полный кадр** — исходное 16:9 масштабируется до 1080×1320 (контентная область)
+- **Размытый фон** (вкл/выкл) — контент накладывается на размытый full-frame фон (1080×1920)
+- **Баннерные поля** (вкл/выкл, настраивается) — поля сверху/снизу для баннеров
+- **Anti-copyright** (вкл/выкл) — горизонтальный флип + коррекция контраста/яркости
+
+#### Субтитры
+
+- **Word-group SRT** — группировка слов по 2-4, одна строка без переносов
+- **Выше баннера** — субтитры подняты на `position_y` px от низа
+- **Точная синхронизация** — по word-level таймстемпам Whisper
+- **Транскрипция фильма** делается 1 раз, сохраняется в JSON, переиспользуется для всех клипов
+
+#### Smart Centering
+
+Для длинных сцен (>60с) алгоритм ищет окно с максимальной плотностью слов — клип начинается там, где самый насыщенный диалог. Шаг скользящего окна — 1с.
+
+#### GPU auto-detection
+
+При запуске Whisper: проверка CUDA → проба compute types (`float16` → `int8_float16` → CPU `int8`) → печать модели GPU и расчётного времени.
+
+#### Слияние сцен (без снежного кома)
+
+Буферный алгоритм: короткие сцены (<15с) объединяются, но никогда не расширяют уже готовую сцену. Паузы >2с создают границу. Итог: осмысленные фрагменты 15-120с вместо гигантских 400-секундных сцен.
+
+### Лицензия
+
+[MIT](LICENSE) — можно свободно использовать, модифицировать и распространять.
