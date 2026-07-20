@@ -13,10 +13,10 @@ scenedetect[opencv]>=0.6,<1.0
 # Computer vision (Haar cascade for face detection)
 opencv-python>=4.5.0
 
-# GUI (pinned — known to work together)
-gradio==4.44.1
-gradio_client==1.3.0
-huggingface_hub==0.22.2
+# GUI (version range for Python compatibility)
+gradio>=4.44.1,<5.0
+gradio_client>=1.3.0,<2.0
+huggingface_hub>=0.22.2,<1.0
 
 # HTTP client for LLM API
 httpx>=0.24.0

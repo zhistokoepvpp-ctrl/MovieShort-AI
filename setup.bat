@@ -112,7 +112,8 @@ echo.
 echo Installing dependencies...
 call venv\Scripts\activate.bat
 
-pip install --upgrade pip -q
+:: Upgrade pip, setuptools, wheel for proper dependency resolution
+pip install --upgrade pip setuptools wheel -q
 pip install -r requirements.txt
 if %errorlevel% neq 0 (
     echo [ERROR] Could not install dependencies
