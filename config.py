@@ -10,7 +10,7 @@ TEMP_DIR = OUTPUT_DIR / "temp"
 
 # Whisper settings
 WHISPER_MODEL = "medium"        # tiny/base/small/medium/large-v3
-WHISPER_LANGUAGE = "ru"          # Only Russian supported
+WHISPER_LANGUAGE = "ru"          # Default language for transcription (ru/en)
 WHISPER_DEVICE = "auto"          # "auto", "cpu", or "cuda"
 FORCE_CPU = False                # True = force CPU even if GPU available
 WHISPER_BEAM_SIZE = 5            # Beam size for transcription accuracy

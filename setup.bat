@@ -7,19 +7,68 @@ echo     MovieShort AI - Setup
 echo ========================================
 echo.
 
-:: --- Check Python -----------------------------------------
+:: --- Check / Install Python ---------------------------------
 python --version >nul 2>&1
+if %errorlevel% equ 0 goto python_found
+
+:: --- Auto-download Python if missing ------------------------
+echo [INFO] Python not found. Attempting automatic installation...
+
+:: Strategy 1: winget (Windows 10 1809+ / Windows 11)
+winget install Python.Python.3.11 --silent --accept-package-agreements >nul 2>&1
+if %errorlevel% equ 0 (
+    echo [OK] Python installed via winget.
+    set "PYTHON_INSTALLED=1"
+    goto refresh_python_path
+)
+
+:: Strategy 2: download from python.org
+echo [INFO] Downloading Python 3.11 from python.org...
+curl -sL -o "%TEMP%\python-installer.exe" https://www.python.org/ftp/python/3.11.11/python-3.11.11-amd64.exe
 if %errorlevel% neq 0 (
-    echo [ERROR] Python not found.
-    echo Download Python 3.9-3.11: https://www.python.org/downloads/
-    echo Check "Add Python to PATH" during install.
+    echo [ERROR] Could not download Python.
+    echo Download manually: https://www.python.org/downloads/
+    echo Make sure to check "Add Python to PATH" during install.
     pause
     exit /b 1
 )
+echo Installing Python (this may take a minute)...
+"%TEMP%\python-installer.exe" /quiet InstallAllUsers=0 PrependPath=1 Include_test=0 Shortcuts=0
+del "%TEMP%\python-installer.exe" >nul 2>&1
+if %errorlevel% neq 0 (
+    echo [ERROR] Python installation failed.
+    pause
+    exit /b 1
+)
+echo [OK] Python installed.
+set "PYTHON_INSTALLED=1"
+
+:refresh_python_path
+:: Refresh PATH so the newly installed Python is visible
+set "PATH=%LocalAppData%\Programs\Python\Python311\;%LocalAppData%\Programs\Python\Python311\Scripts\;%ProgramFiles%\Python311\;%ProgramFiles%\Python311\Scripts\;%PATH%"
+
+python --version >nul 2>&1
+if %errorlevel% equ 0 goto python_found
+
+:: Last resort: try py launcher
+py --version >nul 2>&1
+if %errorlevel% equ 0 (
+    echo [OK] Python launcher found. Using py.exe.
+    set "PYTHON=py"
+    goto check_ffmpeg
+)
+
+echo [ERROR] Python installed but not found in PATH.
+echo Please restart this script or add Python manually to PATH.
+pause
+exit /b 1
+
+:python_found
 for /f "tokens=2" %%i in ('python --version 2^>^&1') do set py_ver=%%i
 echo [OK] Python %py_ver%
 
 :: --- Check FFmpeg ------------------------------------------
+:check_ffmpeg
 where ffmpeg >nul 2>&1
 if %errorlevel% neq 0 (
     echo.
@@ -45,7 +94,12 @@ if exist venv (
     echo Removing old virtual environment...
     rmdir /s /q venv
 )
-python -m venv venv
+
+if defined PYTHON (
+    %PYTHON% -m venv venv
+) else (
+    python -m venv venv
+)
 if %errorlevel% neq 0 (
     echo [ERROR] Could not create virtual environment
     pause
