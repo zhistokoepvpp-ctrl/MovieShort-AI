@@ -5,7 +5,7 @@
 > Built with PySceneDetect, faster-whisper, FFmpeg, and LLM scoring (Yandex AI Studio DeepSeek V4 / Gemini).
 
 ![Status](https://img.shields.io/badge/status-stable-green)
-![Python](https://img.shields.io/badge/python-3.9%20|%203.10%20|%203.11%20|%203.12%20|%203.13-3776AB?logo=python&logoColor=white)
+![Python](https://img.shields.io/badge/python-3.9%20|%203.10%20|%203.11%20|%203.12%20|%203.13%20|%203.14-3776AB?logo=python&logoColor=white)
 ![FFmpeg](https://img.shields.io/badge/ffmpeg-required-007ACC?logo=ffmpeg&logoColor=white)
 ![Platform](https://img.shields.io/badge/platform-Windows-0078D4?logo=windows&logoColor=white)
 ![License](https://img.shields.io/badge/license-MIT-green)
@@ -54,7 +54,7 @@ Opens at `http://localhost:7860`.
 
 #### Prerequisites
 
-- **Python 3.9+** (auto-downloaded by `setup.bat` if missing)
+- **Python 3.9+** (if missing, `setup.bat` shows a download link to python.org)
 - **FFmpeg** (auto-installed via `setup.bat`)
 - **NVIDIA GPU** (optional, speeds up transcription 5-10x)
 
@@ -141,7 +141,7 @@ run.bat
 
 #### Зависимости
 
-- **Python 3.9+** (автоматически загружается `setup.bat` при отсутствии)
+- **Python 3.9+** (если нет — `setup.bat` покажет ссылку на python.org)
 - **FFmpeg** (установится автоматически через `setup.bat`)
 - **NVIDIA GPU** (опционально, ускоряет транскрипцию в 5-10×)
 
