@@ -10,7 +10,7 @@ from pathlib import Path
 
 import config
 from analyzers.detector import find_best_clips_standard
-from analyzers.text_analyzer import ask_llm_context_mode
+from analyzers.text_analyzer import ask_llm_context_mode, call_llm
 from core.pipeline import process_clip
 from core.subtitle import load_segments_json
 
@@ -110,13 +110,16 @@ def process_movie(video_path, settings=None):
     print(f"STEP 2: Processing {len(best_scenes)} clips...")
     print("=" * 50)
 
-    # Find pre-transcribed transcript JSON — match by video filename exactly
+    # Find pre-transcribed transcript JSON — match by video+language+model hash
+    import hashlib
     transcript_json = None
     video_basename = Path(video_path).stem.split('.')[0]
-    expected = str(config.TEMP_DIR / f"full_transcript_{video_basename}.json")
+    hash_input = f"{video_path}_{film_language}_{config.WHISPER_MODEL}"
+    file_hash = hashlib.md5(hash_input.encode()).hexdigest()[:8]
+    expected = str(config.TEMP_DIR / f"full_transcript_{video_basename}_{file_hash}.json")
     if os.path.exists(expected):
         transcript_json = expected
-        print(f"Found pre-transcribed transcript: full_transcript_{video_basename}.json")
+        print(f"Found pre-transcribed transcript: full_transcript_{video_basename}_{file_hash}.json")
 
     # Pre-load transcript segments for smart clip centering
     clip_segments = None
@@ -235,6 +238,63 @@ def _format_time(seconds):
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
+def _snap_scene_boundary(clip_segments, scene_start, scene_end, max_dur):
+    """Snap clip end to nearest sentence boundary within [max_dur-3, max_dur+5].
+
+    Priority:
+    1. Sentence end (. ! ?) in [max_dur-3, max_dur+5]
+    2. Pause in dialogue >0.8s between whisper segments
+    3. Word boundary (fallback)
+
+    Returns (new_end, extended) where new_end <= scene_end.
+    """
+    if not clip_segments:
+        return scene_start + max_dur, False
+
+    # Filter segments in the [scene_start, scene_end] range
+    overlapping = [
+        s for s in clip_segments
+        if s["start"] < scene_end and s["end"] > scene_start
+    ]
+    if not overlapping:
+        return scene_start + max_dur, False
+
+    # Search range: [max_dur - 3, max_dur + 5]
+    search_start = scene_start + max(0, max_dur - 3)
+    search_end = min(scene_end, scene_start + max_dur + 5)
+
+    # Priority 1: Find sentence-ending punctuation in word timestamps
+    best_end = None
+
+    for seg in overlapping:
+        seg_end = seg["end"]
+        if search_start <= seg_end <= search_end:
+            text = seg.get("text", "").strip()
+            if text and text[-1] in ".!?…":
+                if best_end is None or seg_end > best_end:
+                    best_end = seg_end
+
+    if best_end is not None:
+        extended = best_end > scene_start + max_dur
+        return best_end, extended
+
+    # Priority 2: Find dialogue pause > 0.8s between consecutive segments
+    sorted_segs = sorted(overlapping, key=lambda s: s["start"])
+    for i in range(len(sorted_segs) - 1):
+        gap = sorted_segs[i + 1]["start"] - sorted_segs[i]["end"]
+        if gap > 0.8 and search_start <= sorted_segs[i]["end"] <= search_end:
+            if best_end is None or sorted_segs[i]["end"] > best_end:
+                best_end = sorted_segs[i]["end"]
+
+    if best_end is not None:
+        extended = best_end > scene_start + max_dur
+        return best_end, extended
+
+    # Priority 3: Word boundary — just use max_dur
+    new_end = min(scene_end, scene_start + max_dur)
+    return new_end, False
+
+
 # ---------------------------------------------------------------------------
 # Context Mode — LLM sees real scene transcripts, picks best scenes directly
 # ---------------------------------------------------------------------------
@@ -272,6 +332,20 @@ def find_best_clips_context(video_path, movie_title, api_key, provider="gemini",
     total_duration = scenes[-1]["end"] if scenes else 0
     print(f"  Movie duration: {_format_time(total_duration)} ({total_duration:.0f}s)")
     print(f"  {len(scenes)} scenes with transcription")
+
+    # Load clip_segments (whisper word-level timestamps) for smart snapping
+    import hashlib
+    clip_segments = None
+    from core.subtitle import load_segments_json
+    video_basename = os.path.basename(str(video_path)).split('.')[0]
+    hash_input = f"{video_path}_{language}_{config.WHISPER_MODEL}"
+    file_hash = hashlib.md5(hash_input.encode()).hexdigest()[:8]
+    transcript_path = str(config.TEMP_DIR / f"full_transcript_{video_basename}_{file_hash}.json")
+    if os.path.exists(transcript_path):
+        try:
+            clip_segments = load_segments_json(transcript_path)
+        except Exception:
+            pass
 
     # Step 2: Send scene transcripts to LLM
     print("[Context] Step 2: Asking LLM to analyze scene transcripts...")
@@ -320,17 +394,99 @@ def find_best_clips_context(video_path, movie_title, api_key, provider="gemini",
         print(f"  Scene {scene_num}: {_format_time(start)}-{_format_time(end)} "
               f"({duration:.0f}s, score={score}) {title}")
 
-        # Enforce duration limits
+        # LLM Split-or-Keep: for long scenes with dialogue and API key
+        from analyzers.text_analyzer import PROMPT_SCENE_SPLIT_OR_KEEP, _parse_split_or_keep
+
+        if duration > 30 and clip_segments and api_key:
+            # Build dialogue text for this scene
+            overlapping = [
+                s for s in clip_segments
+                if s["start"] < end and s["end"] > start
+            ]
+            overlapping.sort(key=lambda s: s["start"])
+            dialogue = " ".join(s.get("text", "") for s in overlapping).strip()
+
+            if dialogue:
+                try:
+                    prompt = PROMPT_SCENE_SPLIT_OR_KEEP.format(
+                        movie_title=movie_title,
+                        dialogue=dialogue,
+                        scene_duration=duration,
+                    )
+                    raw = call_llm(prompt, api_key, provider, max_tokens=512)
+                    split_result = _parse_split_or_keep(raw, duration)
+
+                    if split_result["decision"] == "keep":
+                        # Entire scene as one clip — ignore max_duration
+                        print(f"         LLM: ОДНА цельная сцена — {duration:.0f}s (max_duration ignored)")
+                        found_clips.append({
+                            "start": start,
+                            "end": end,
+                            "duration": duration,
+                            "text": scene.get("text", ""),
+                            "score": score,
+                            "title": title[:40],
+                        })
+                        continue
+
+                    elif split_result["decision"] == "split":
+                        print(f"         LLM: НЕСКОЛЬКО частей — {len(split_result['parts'])} parts")
+                        for rel_start, rel_end in split_result["parts"]:
+                            abs_start = start + rel_start
+                            abs_end = start + rel_end
+                            snapped_end, _ = _snap_scene_boundary(
+                                clip_segments, abs_start, abs_end, max_duration
+                            )
+                            part_dur = snapped_end - abs_start
+                            found_clips.append({
+                                "start": abs_start,
+                                "end": snapped_end,
+                                "duration": part_dur,
+                                "text": scene.get("text", ""),
+                                "score": score,
+                                "title": title[:40],
+                            })
+                            print(f"           Часть: {_format_time(abs_start)}-{_format_time(snapped_end)} ({part_dur:.0f}s)")
+                        continue
+                except Exception:
+                    print(f"         LLM split-or-keep failed, using smart snapping fallback")
+
+        # Duration enforcement — expand short scenes to min_duration
         if duration < min_duration:
-            mid = (start + end) / 2
-            start = max(0, mid - min_duration / 2)
-            end = start + min_duration
+            # Priority: anchor expansion on sentence boundary (first whisper segment)
+            if clip_segments:
+                overlapping = sorted(
+                    [s for s in clip_segments if s["start"] < end and s["end"] > start],
+                    key=lambda s: s["start"],
+                )
+                if overlapping and overlapping[0]["start"] < start + min_duration:
+                    sentence_start = overlapping[0]["start"]
+                    new_start = max(start, sentence_start)
+                    new_end = min(end, new_start + min_duration)
+                    if new_end > end:
+                        new_end = end
+                        new_start = max(start, new_end - min_duration)
+                    start, end = new_start, new_end
+                else:
+                    # Fallback: symmetric expansion
+                    mid = (start + end) / 2
+                    start = max(0, mid - min_duration / 2)
+                    end = start + min_duration
+            else:
+                # No transcript available — simple center expansion
+                mid = (start + end) / 2
+                start = max(0, mid - min_duration / 2)
+                end = start + min_duration
             duration = end - start
-            print(f"         Увеличена до {min_duration}с (мин. длительность)")
+            print(f"         Увеличена до {duration:.0f}с (мин. длительность)")
         elif duration > max_duration:
-            end = start + max_duration
+            new_end, extended = _snap_scene_boundary(clip_segments, start, end, max_duration)
+            if extended:
+                print(f"         Укорочена до {new_end - start:.0f}с (снаппинг по границе предложения, +{new_end - (start + max_duration):.0f}с)")
+            else:
+                print(f"         Укорочена до {max_duration}с (макс. длительность)")
+            end = new_end
             duration = end - start
-            print(f"         Укорочена до {max_duration}с (макс. длительность)")
 
         found_clips.append({
             "start": start,
