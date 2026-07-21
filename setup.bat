@@ -7,65 +7,90 @@ echo     MovieShort AI - Setup
 echo ========================================
 echo.
 
-:: --- Check / Install Python ---------------------------------
+:: --- Check Python -------------------------------------------
 python --version >nul 2>&1
-if %errorlevel% equ 0 goto python_found
+if %errorlevel% equ 0 goto python_in_path
 
-:: --- Auto-download Python if missing ------------------------
-echo [INFO] Python not found. Attempting automatic installation...
-
-:: Strategy 1: winget (Windows 10 1809+ / Windows 11)
-winget install Python.Python.3.11 --silent --accept-package-agreements >nul 2>&1
-if %errorlevel% equ 0 (
-    echo [OK] Python installed via winget.
-    set "PYTHON_INSTALLED=1"
-    goto refresh_python_path
-)
-
-:: Strategy 2: download from python.org
-echo [INFO] Downloading Python 3.11 from python.org...
-curl -sL -o "%TEMP%\python-installer.exe" https://www.python.org/ftp/python/3.11.11/python-3.11.11-amd64.exe
-if %errorlevel% neq 0 (
-    echo [ERROR] Could not download Python.
-    echo Download manually: https://www.python.org/downloads/
-    echo Make sure to check "Add Python to PATH" during install.
-    pause
-    exit /b 1
-)
-echo Installing Python (this may take a minute)...
-"%TEMP%\python-installer.exe" /quiet InstallAllUsers=0 PrependPath=1 Include_test=0 Shortcuts=0
-del "%TEMP%\python-installer.exe" >nul 2>&1
-if %errorlevel% neq 0 (
-    echo [ERROR] Python installation failed.
-    pause
-    exit /b 1
-)
-echo [OK] Python installed.
-set "PYTHON_INSTALLED=1"
-
-:refresh_python_path
-:: Refresh PATH so the newly installed Python is visible
-set "PATH=%LocalAppData%\Programs\Python\Python311\;%LocalAppData%\Programs\Python\Python311\Scripts\;%ProgramFiles%\Python311\;%ProgramFiles%\Python311\Scripts\;%PATH%"
-
-python --version >nul 2>&1
-if %errorlevel% equ 0 goto python_found
-
-:: Last resort: try py launcher
+:: Python not in PATH — try py launcher (installed with Python even without PATH)
+:: Try known-stable versions first (3.14 is too new for some deps)
 py --version >nul 2>&1
 if %errorlevel% equ 0 (
-    echo [OK] Python launcher found. Using py.exe.
-    set "PYTHON=py"
-    goto check_ffmpeg
+    for %%v in (3.11 3.12 3.13) do (
+        py -%%v --version >nul 2>&1
+        if not errorlevel 1 (
+            set "PYTHON=py -%%v"
+            for /f "tokens=2" %%a in ('py -%%v --version 2^>^&1') do set py_ver=%%a
+            goto py_found
+        )
+    )
+    :: Fallback to latest (3.14+)
+    for /f "tokens=2" %%v in ('py --version 2^>^&1') do set py_ver=%%v
+    set "PYTHON=py -3"
+    echo [WARNING] Python %py_ver% is very new.
+    echo          If pip fails, install Python 3.11/3.12 from python.org and re-run.
+    goto py_found
 )
 
-echo [ERROR] Python installed but not found in PATH.
-echo Please restart this script or add Python manually to PATH.
+:py_found
+echo [OK] Python %py_ver% (via py launcher)
+goto python_found
+
+:: Search common install directories
+echo [INFO] Python not in PATH — scanning standard locations...
+for %%d in (
+    "C:\Program Files\Python313"
+    "C:\Program Files\Python312"
+    "C:\Program Files\Python311"
+    "C:\Program Files\Python310"
+    "C:\Program Files\Python39"
+    "%LOCALAPPDATA%\Programs\Python\Python313"
+    "%LOCALAPPDATA%\Programs\Python\Python312"
+    "%LOCALAPPDATA%\Programs\Python\Python311"
+    "%LOCALAPPDATA%\Programs\Python\Python310"
+    "%LOCALAPPDATA%\Programs\Python\Python39"
+) do (
+    if exist "%%~d\python.exe" (
+        set "PYTHON="%%~d\python.exe""
+        for /f "tokens=2" %%v in ('"%%~d\python.exe" --version 2^>^&1') do set py_ver=%%v
+        echo [OK] Python %py_ver% (found in %%~d)
+        goto python_found
+    )
+)
+
+:: Check Microsoft Store Python
+if exist "%LOCALAPPDATA%\Microsoft\WindowsApps\python.exe" (
+    set "PYTHON="%LOCALAPPDATA%\Microsoft\WindowsApps\python.exe""
+    for /f "tokens=2" %%v in ('"%LOCALAPPDATA%\Microsoft\WindowsApps\python.exe" --version 2^>^&1') do set py_ver=%%v
+    echo [OK] Python %py_ver% (Microsoft Store)
+    goto python_found
+)
+
+:: No Python found anywhere
+cls
+echo ========================================
+echo     MovieShort AI - Setup
+echo ========================================
+echo.
+echo [ERROR] Python not found!
+echo.
+echo Python 3.9+ is required to run this program.
+echo Download: https://www.python.org/downloads/
+echo.
+echo Make sure to check "Add Python to PATH" during install.
+echo.
+echo If Python is already installed but not in PATH:
+echo   1. Run the installer again
+echo   2. Select "Modify"
+echo   3. Check "Add Python to environment variables"
+echo.
 pause
 exit /b 1
 
-:python_found
+:python_in_path
 for /f "tokens=2" %%i in ('python --version 2^>^&1') do set py_ver=%%i
 echo [OK] Python %py_ver%
+
+:python_found
 
 :: --- Check FFmpeg ------------------------------------------
 :check_ffmpeg
@@ -117,6 +142,13 @@ pip install --upgrade pip setuptools wheel -q
 pip install -r requirements.txt
 if %errorlevel% neq 0 (
     echo [ERROR] Could not install dependencies
+    echo.
+    echo Common fixes:
+    echo - Python 3.14 may be too new for some packages.
+    echo   Install Python 3.11/3.12/3.13 from python.org and re-run setup.bat.
+    echo - If you have a slow internet connection, some downloads may time out.
+    echo   Try running: pip install -r requirements.txt
+    echo.
     pause
     exit /b 1
 )

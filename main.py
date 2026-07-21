@@ -35,7 +35,6 @@ def main():
     app.launch(
         server_port=config.GRADIO_PORT,
         share=config.GRADIO_SHARE,
-        show_error=True,
     )
 
 
