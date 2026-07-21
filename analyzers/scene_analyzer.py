@@ -1,6 +1,7 @@
 """
 MovieShort AI — Scene detection and transcription analyzer.
 """
+import hashlib
 import re
 import time as time_module
 import subprocess
@@ -11,6 +12,7 @@ from scenedetect import open_video, SceneManager, ContentDetector
 from core.subtitle import transcribe, _transcribe_audio_file
 import config
 from utils import fmt_duration as _fmt_duration
+from utils.ffmpeg_utils import _detect_gpu_accel
 # _fmt_duration is imported from utils — no local definition needed
 
 
@@ -185,7 +187,9 @@ def get_scene_transcripts(video_path, scenes, language=None):
         audio_duration = float(result.stdout.strip())
         est_extract = max(20, audio_duration / 250)
         print(f"  Audio duration: {audio_duration/60:.1f} min")
-        print(f"  Est. extraction: ~{_fmt_duration(est_extract)} (ffmpeg, CPU)")
+        gpu = _detect_gpu_accel()
+        gpu_tag = "CUDA" if gpu else "CPU"
+        print(f"  Est. extraction: ~{_fmt_duration(est_extract)} (ffmpeg, {gpu_tag})")
     except FileNotFoundError:
         print()
         print("  ⚠️  ffprobe/ffmpeg не найдены!")
@@ -269,9 +273,12 @@ def get_scene_transcripts(video_path, scenes, language=None):
 
     # Save full transcript to JSON for reuse across clips
     from core.subtitle import save_segments_json
+    video_basename = os.path.basename(str(video_path)).split('.')[0]
+    hash_input = f"{video_path}_{language}_{config.WHISPER_MODEL}"
+    file_hash = hashlib.md5(hash_input.encode()).hexdigest()[:8]
     transcript_json = os.path.join(
         str(config.TEMP_DIR),
-        f"full_transcript_{os.path.basename(str(video_path)).split('.')[0]}.json"
+        f"full_transcript_{video_basename}_{file_hash}.json"
     )
     save_segments_json(all_segments, transcript_json)
 
