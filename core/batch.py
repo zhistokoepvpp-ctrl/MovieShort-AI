@@ -10,7 +10,7 @@ from pathlib import Path
 
 import config
 from analyzers.detector import find_best_clips_standard
-from analyzers.text_analyzer import ask_llm_context_mode, call_llm
+from analyzers.text_analyzer import call_llm
 from core.pipeline import process_clip, process_multiple
 from core.subtitle import load_segments_json
 from utils import get_video_basename
@@ -302,13 +302,137 @@ def _snap_scene_boundary(clip_segments, scene_start, scene_end, max_dur):
 # Context Mode — LLM sees real scene transcripts, picks best scenes directly
 # ---------------------------------------------------------------------------
 
+def _validate_sub_clips(sub_clips, block_start, block_end, block_duration):
+    """Validate sub-clips from LLM response.
+
+    Applies per-sub-clip:
+    1. Within block bounds
+    2. Duration >= 20s (unless self-contained)
+    3. Duration <= 75s
+    4. Score 1-10
+    5. No negative start or overflow
+
+    Returns filtered list with logged drops.
+    """
+    valid = []
+    for sc in sub_clips:
+        sc_start = block_start + sc.get("start", 0)
+        sc_end = block_start + sc.get("end", block_duration)
+        sc_dur = sc_end - sc_start
+        sc_score = sc.get("score", 5)
+        sc_title = sc.get("title", "") or "untitled"
+        sc_reason = sc.get("reason", "")
+
+        if sc_start < 0 or sc_end > block_end:
+            print(f"  ⛔ «{sc_title}» {sc_start:.0f}-{sc_end:.0f} — вне границ блока")
+            continue
+        if sc_dur < 20 and sc_reason not in ("самодостаточен", "self_contained"):
+            print(f"  ⛔ «{sc_title}» {sc_start:.0f}-{sc_end:.0f} — слишком короткий ({sc_dur:.0f}s)")
+            continue
+        if sc_dur > 75:
+            print(f"  ⛔ «{sc_title}» {sc_start:.0f}-{sc_end:.0f} — слишком длинный ({sc_dur:.0f}s)")
+            continue
+        if sc_score < 1 or sc_score > 10:
+            print(f"  ⛔ «{sc_title}» — неверная оценка {sc_score}")
+            continue
+
+        valid.append({
+            "start": sc_start,
+            "end": sc_end,
+            "duration": sc_dur,
+            "text": sc.get("text", ""),
+            "score": sc_score,
+            "title": sc_title[:40],
+        })
+    return valid
+
+
+def _expand_short_clips(clips, min_duration):
+    """Expand clips shorter than min_duration symmetrically."""
+    result = []
+    for clip in clips:
+        dur = clip["end"] - clip["start"]
+        if dur < min_duration:
+            mid = (clip["start"] + clip["end"]) / 2
+            new_start = max(0, mid - min_duration / 2)
+            new_end = new_start + min_duration
+            clip["start"] = new_start
+            clip["end"] = new_end
+            clip["duration"] = new_end - new_start
+        result.append(clip)
+    return result
+
+
+def _merge_blocks_for_llm(blocks, target_duration=120, max_duration=150):
+    """Merge adjacent blocks into super-blocks of ~target_duration seconds.
+
+    Preserves original scene boundaries within each super-block metadata.
+    Combines text, pause_points, cut_count. Keeps audio_peaks from the
+    longest constituent block.
+
+    Args:
+        blocks: list of block dicts from detect_and_transcribe()
+        target_duration: target duration in seconds (default 120)
+        max_duration: maximum duration before force-finalize (default 150)
+
+    Returns:
+        list of merged block dicts with same schema as input blocks
+    """
+    if not blocks:
+        return []
+
+    merged = []
+    buffer = dict(blocks[0])  # shallow copy
+
+    for b in blocks[1:]:
+        b = dict(b)
+        # Force-finalize if buffer already at max
+        if buffer["duration"] >= max_duration:
+            merged.append(buffer)
+            buffer = b
+            continue
+
+        # If buffer is below target, merge this block in
+        if buffer["duration"] < target_duration:
+            buffer["end"] = b["end"]
+            buffer["duration"] = buffer["end"] - buffer["start"]
+            # Combine texts
+            txt_a = buffer.get("text", "") or ""
+            txt_b = b.get("text", "") or ""
+            buffer["text"] = (txt_a + " " + txt_b).strip()
+            # Merge pause_points
+            buffer["pause_points"] = (
+                buffer.get("pause_points", []) + b.get("pause_points", [])
+            )
+            # Sum cut_count
+            buffer["cut_count"] = buffer.get("cut_count", 0) + b.get("cut_count", 0)
+            # Keep audio_peaks from the longer sub-block
+            if b.get("duration", 0) > buffer.get("_dominant_dur", 0):
+                buffer["audio_peaks"] = b.get("audio_peaks", {})
+                buffer["_dominant_dur"] = b.get("duration", 0)
+        else:
+            # Buffer is >= target — finalize, start new buffer
+            merged.append(buffer)
+            buffer = b
+
+    if buffer:
+        merged.append(buffer)
+
+    # Strip internal helper fields
+    for m in merged:
+        m.pop("_dominant_dur", None)
+
+    return merged
+
+
 def find_best_clips_context(video_path, movie_title, api_key, provider="gemini",
                             max_duration=60, min_duration=15,
                             num_clips=10, score_threshold=7.0, language="ru"):
-    """Context mode: detect scenes, transcribe, send transcripts to LLM.
+    """Context mode: detect blocks → LLM splits each block into sub-clips.
 
-    LLM sees the real dialogue text of each scene and returns scene numbers
-    directly — no matching, no stemming, no timing guesswork.
+    Each block from detect_and_transcribe() carries metadata:
+    pause_points, cut_count, audio_peaks. LLM decides boundaries and titles
+    per block in one call. Falls back to smart centering when LLM returns empty.
 
     Args:
         video_path: path to video file
@@ -323,228 +447,242 @@ def find_best_clips_context(video_path, movie_title, api_key, provider="gemini",
 
     Returns list of {start, end, duration, text, score, title} or None.
     """
+    import json
+    import time
+    from pathlib import Path
+
     from analyzers.scene_analyzer import detect_and_transcribe
+    from analyzers.text_analyzer import PROMPT_BATCH_TO_CLIPS, PROMPT_BATCH_TO_CLIPS_EN, _parse_batch_response
 
-    print("[Context] Step 1: Detecting scenes and transcribing...")
-    scenes = detect_and_transcribe(video_path, language=language)
+    video_basename = Path(video_path).stem
+    total_start = time.time()
+    print(f"\n🎬 {video_basename}: Context mode — block-based LLM pipeline")
 
-    if not scenes:
-        print("  No scenes detected, falling back to standard mode")
+    # Step 1: Detect scenes + transcribe (now returns blocks with metadata)
+    print("[Context] Detecting scenes and transcribing...")
+    blocks = detect_and_transcribe(video_path, language=language)
+
+    if not blocks:
+        print("  No blocks detected, falling back to standard mode")
         return None
 
-    total_duration = scenes[-1]["end"] if scenes else 0
+    total_duration = blocks[-1]["end"] if blocks else 0
     print(f"  Movie duration: {_format_time(total_duration)} ({total_duration:.0f}s)")
-    print(f"  {len(scenes)} scenes with transcription")
+    print(f"  {len(blocks)} blocks with transcription")
 
-    # Load clip_segments (whisper word-level timestamps) for smart snapping
-    import hashlib
-    clip_segments = None
-    from core.subtitle import load_segments_json
-    video_basename = get_video_basename(video_path)
-    hash_input = f"{video_path}_{language}_{config.WHISPER_MODEL}"
-    file_hash = hashlib.md5(hash_input.encode()).hexdigest()[:8]
-    transcript_path = str(config.TEMP_DIR / f"full_transcript_{video_basename}_{file_hash}.json")
-    if os.path.exists(transcript_path):
-        try:
-            clip_segments = load_segments_json(transcript_path)
-        except Exception:
-            pass
+    # Step 1.5: Merge small blocks into super-blocks for LLM to work with
+    before_merge = len(blocks)
+    blocks = _merge_blocks_for_llm(blocks)
+    print(f"  Merged {before_merge} → {len(blocks)} super-blocks "
+          f"(target 120s, range 90-150s)")
 
-    # Step 2: Send scene transcripts to LLM
-    print("[Context] Step 2: Asking LLM to analyze scene transcripts...")
-    rated = ask_llm_context_mode(
-        scenes, movie_title, api_key, provider,
-        language=language,
-    )
+    # Step 1.6: Filter out silent blocks (no dialogue) — user doesn't want clips from them
+    before_filter = len(blocks)
+    blocks = [b for b in blocks if b.get("text", "").strip()]
+    filtered_silent = before_filter - len(blocks)
+    if filtered_silent:
+        print(f"  Filtered out {filtered_silent} silent block(s) (no dialogue)")
 
-    if not rated:
-        print("  LLM returned no results, falling back to standard mode")
+    if not blocks:
+        print("  No blocks with dialogue — nothing to process")
         return None
 
-    print(f"  LLM rated {len(rated)} scenes")
+    BATCH_SIZE = 2
+    batch_template = PROMPT_BATCH_TO_CLIPS if language == "ru" else PROMPT_BATCH_TO_CLIPS_EN
+    all_sub_clips = []
+    total_batches = (len(blocks) + BATCH_SIZE - 1) // BATCH_SIZE
 
-    # Check for duplicate scene numbers
-    seen_nums = set()
-    duplicates = 0
-    for item in rated:
-        if item["scene_num"] in seen_nums:
-            print(f"  ⚠️ Дубликат сцены {item['scene_num']} — пропускаю")
-            duplicates += 1
-        seen_nums.add(item["scene_num"])
-    if duplicates:
-        print(f"  {duplicates} duplicates ignored")
+    # Step 2: Process blocks in batches through LLM
+    print(f"[Context] Processing {len(blocks)} blocks in batches of {BATCH_SIZE} "
+          f"(~{total_batches} LLM calls)...")
+    for batch_idx in range(0, len(blocks), BATCH_SIZE):
+        batch_blocks = blocks[batch_idx:batch_idx + BATCH_SIZE]
+        batch_num = batch_idx // BATCH_SIZE + 1
 
-    # Step 3: Build clip list from LLM results
-    print("[Context] Step 3: Building clip list...")
-    found_clips = []
+        # Build blocks_text for the combined prompt
+        block_texts = []
+        for i, block in enumerate(batch_blocks):
+            global_idx = batch_idx + i
+            block_start = block["start"]
+            block_end = block["end"]
+            block_dur = block_end - block_start
+            dialogue = block.get("text", "").strip() or "(нет диалога)"
+            cut_count = block.get("cut_count", 0)
+            pause_points = block.get("pause_points", [])
 
-    for item in rated:
-        scene_num = item.get("scene_num", 0)
-        score = item.get("score", 5)
-        title = item.get("title", "")
+            dialogue_preview = (dialogue[:80] + "...") if len(dialogue) > 80 else dialogue
+            print(f"\n  Block {global_idx+1}/{len(blocks)}: {_format_time(block_start)}-{_format_time(block_end)} ({block_dur:.0f}s)")
+            print(f"    Dialogue: {dialogue_preview}")
+            print(f"    Cuts: {cut_count}, Pauses: {len(pause_points)}")
 
-        # Convert 1-based to 0-based index
-        idx = scene_num - 1
-        if idx < 0 or idx >= len(scenes):
-            print(f"  Scene {scene_num}: invalid number (have {len(scenes)} scenes)")
-            continue
-
-        scene = scenes[idx]
-        start = scene["start"]
-        end = scene["end"]
-        duration = end - start
-
-        print(f"  Scene {scene_num}: {_format_time(start)}-{_format_time(end)} "
-              f"({duration:.0f}s, score={score}) {title}")
-
-        # LLM Split-or-Keep: for long scenes with dialogue and API key
-        from analyzers.text_analyzer import PROMPT_SCENE_SPLIT_OR_KEEP, _parse_split_or_keep
-
-        if duration > 30 and clip_segments and api_key:
-            # Build dialogue text for this scene
-            overlapping = [
-                s for s in clip_segments
-                if s["start"] < end and s["end"] > start
-            ]
-            overlapping.sort(key=lambda s: s["start"])
-            dialogue = " ".join(s.get("text", "") for s in overlapping).strip()
-
-            if dialogue:
-                try:
-                    prompt = PROMPT_SCENE_SPLIT_OR_KEEP.format(
-                        movie_title=movie_title,
-                        dialogue=dialogue,
-                        scene_duration=duration,
-                    )
-                    raw = call_llm(prompt, api_key, provider, max_tokens=512)
-                    split_result = _parse_split_or_keep(raw, duration)
-
-                    if split_result["decision"] == "keep":
-                        # Entire scene as one clip — ignore max_duration
-                        print(f"         LLM: ОДНА цельная сцена — {duration:.0f}s (max_duration ignored)")
-                        found_clips.append({
-                            "start": start,
-                            "end": end,
-                            "duration": duration,
-                            "text": scene.get("text", ""),
-                            "score": score,
-                            "title": title[:40],
-                        })
-                        continue
-
-                    elif split_result["decision"] == "split":
-                        print(f"         LLM: НЕСКОЛЬКО частей — {len(split_result['parts'])} parts")
-                        for rel_start, rel_end in split_result["parts"]:
-                            abs_start = start + rel_start
-                            abs_end = start + rel_end
-                            snapped_end, _ = _snap_scene_boundary(
-                                clip_segments, abs_start, abs_end, max_duration
-                            )
-                            part_dur = snapped_end - abs_start
-                            found_clips.append({
-                                "start": abs_start,
-                                "end": snapped_end,
-                                "duration": part_dur,
-                                "text": scene.get("text", ""),
-                                "score": score,
-                                "title": title[:40],
-                            })
-                            print(f"           Часть: {_format_time(abs_start)}-{_format_time(snapped_end)} ({part_dur:.0f}s)")
-                        continue
-                except Exception:
-                    print(f"         LLM split-or-keep failed, using smart snapping fallback")
-
-        # Duration enforcement — expand short scenes to min_duration
-        if duration < min_duration:
-            # Priority: anchor expansion on sentence boundary (first whisper segment)
-            if clip_segments:
-                overlapping = sorted(
-                    [s for s in clip_segments if s["start"] < end and s["end"] > start],
-                    key=lambda s: s["start"],
+            if language == "ru":
+                block_texts.append(
+                    f"--- БЛОК {i} ({_format_time(block_start)}-{_format_time(block_end)}, {block_dur:.0f}s) ---\n"
+                    f"Диалог: {dialogue}\n"
+                    f"Смен кадра: {cut_count} (высокое = экшн)\n"
+                    f"Паузы в диалоге: {pause_points}"
                 )
-                if overlapping and overlapping[0]["start"] < start + min_duration:
-                    sentence_start = overlapping[0]["start"]
-                    new_start = max(start, sentence_start)
-                    new_end = min(end, new_start + min_duration)
-                    if new_end > end:
-                        new_end = end
-                        new_start = max(start, new_end - min_duration)
-                    start, end = new_start, new_end
+            else:
+                block_texts.append(
+                    f"--- BLOCK {i} ({_format_time(block_start)}-{_format_time(block_end)}, {block_dur:.0f}s) ---\n"
+                    f"Dialogue: {dialogue}\n"
+                    f"Cut count: {cut_count} (high = action)\n"
+                    f"Dialogue pauses: {pause_points}"
+                )
+
+        blocks_text = "\n\n".join(block_texts)
+        prompt = batch_template.format(
+            movie_name=movie_title,
+            blocks_text=blocks_text,
+        )
+
+        print(f"\n  ── Batch {batch_num}/{total_batches} "
+              f"(blocks {batch_idx+1}-{batch_idx+len(batch_blocks)}) ──")
+
+        # Call LLM once for the entire batch
+        raw_response = None
+        try:
+            raw_response = call_llm(prompt, api_key, provider, max_tokens=4096)
+        except Exception as e:
+            print(f"  ⚠️ Batch {batch_num} LLM failed: {e}")
+
+        # Parse batch response into per-block clip lists
+        if raw_response:
+            block_start_times = [b["start"] for b in batch_blocks]
+            batch_clips = _parse_batch_response(raw_response, block_start_times)
+        else:
+            batch_clips = {}
+
+        # Log raw response if nothing was parsed
+        if raw_response and not batch_clips:
+            raw_short = raw_response.strip()
+            if len(raw_short) > 500:
+                raw_short = raw_short[:500] + "..."
+            print(f"  ⚠️ Batch {batch_num}: LLM returned 0 parsed clips. Raw (truncated):")
+            print(f"     {raw_short}")
+
+        # Process each block in the batch
+        for i, block in enumerate(batch_blocks):
+            global_idx = batch_idx + i
+            block_start = block["start"]
+            block_end = block["end"]
+            block_dur = block_end - block_start
+            dialogue = block.get("text", "").strip()
+
+            # Get clips for this block (absolute timestamps from batch parser)
+            block_clips = batch_clips.get(i, [])
+
+            # Validate — batch clips have absolute timestamps, so pass block_start=0
+            valid_clips = _validate_sub_clips(block_clips, 0, block_end, block_dur) if block_clips else []
+            for vc in valid_clips:
+                vc["text"] = dialogue
+
+            # Debug logging when LLM returns 0 valid clips for this block
+            if len(valid_clips) == 0:
+                if block_clips:
+                    # Parser found clips but validation rejected all
+                    for sc in block_clips:
+                        sc_start = sc.get("start", 0)
+                        sc_end = sc.get("end", block_end)
+                        sc_dur = sc_end - sc_start
+                        sc_score = sc.get("score", 5)
+                        sc_title = sc.get("title", "") or "untitled"
+                        sc_reason = sc.get("reason", "")
+                        reasons = []
+                        if sc_start < block_start or sc_end > block_end:
+                            reasons.append("out_of_bounds")
+                        if sc_dur < 20 and sc_reason not in ("самодостаточен", "self_contained"):
+                            reasons.append(f"too_short({sc_dur:.0f}s)")
+                        if sc_dur > 75:
+                            reasons.append(f"too_long({sc_dur:.0f}s)")
+                        if sc_score < 1 or sc_score > 10:
+                            reasons.append(f"bad_score({sc_score})")
+                        print(f"    ⛔ Rejected: «{sc_title}» {sc_start:.0f}-{sc_end:.0f}s "
+                              f"dur={sc_dur:.0f}s score={sc_score} reason={'/'.join(reasons)}")
                 else:
-                    # Fallback: symmetric expansion
-                    mid = (start + end) / 2
-                    start = max(0, mid - min_duration / 2)
-                    end = start + min_duration
+                    print(f"  ℹ️ Block {global_idx+1}: no clips from LLM")
             else:
-                # No transcript available — simple center expansion
-                mid = (start + end) / 2
-                start = max(0, mid - min_duration / 2)
-                end = start + min_duration
-            duration = end - start
-            print(f"         Увеличена до {duration:.0f}с (мин. длительность)")
-        elif duration > max_duration:
-            new_end, extended = _snap_scene_boundary(clip_segments, start, end, max_duration)
-            if extended:
-                print(f"         Укорочена до {new_end - start:.0f}с (снаппинг по границе предложения, +{new_end - (start + max_duration):.0f}с)")
-            else:
-                print(f"         Укорочена до {max_duration}с (макс. длительность)")
-            end = new_end
-            duration = end - start
+                print(f"  ✅ Block {global_idx+1}: {len(valid_clips)} valid clip(s)")
 
-        found_clips.append({
-            "start": start,
-            "end": end,
-            "duration": duration,
-            "text": scene.get("text", ""),
-            "score": score,
-            "title": title[:40],
-        })
+            # Fallback: if LLM returned nothing but block has dialogue, use smart centering
+            if not valid_clips and dialogue:
+                segments = [{"start": block_start, "end": block_end, "text": dialogue}]
+                fb_start, fb_end = _find_best_window(segments, block_start, block_end, max_duration)
+                if fb_start is not None:
+                    print(f"    → Fallback: smart centering ({fb_start:.0f}-{fb_end:.0f})")
+                    valid_clips.append({
+                        "start": fb_start,
+                        "end": fb_end,
+                        "duration": fb_end - fb_start,
+                        "text": dialogue,
+                        "score": 5.0,
+                        "title": movie_title[:40],
+                    })
 
-    if not found_clips:
+            all_sub_clips.extend(valid_clips)
+
+    if not all_sub_clips:
         print("  No valid clips from LLM results")
         return None
 
-    # Filter by score threshold
-    filtered = [c for c in found_clips if c["score"] >= score_threshold]
+    # Step 3: Sort by start time
+    all_sub_clips.sort(key=lambda x: x["start"])
+
+    # Step 4: Score threshold filter
+    before = len(all_sub_clips)
+    filtered = [c for c in all_sub_clips if c["score"] >= score_threshold]
     if not filtered:
-        found_clips.sort(key=lambda x: x["score"], reverse=True)
-        filtered = found_clips[:max(1, num_clips // 4)]
+        # If nothing passes threshold, keep top N clips anyway
+        all_sub_clips.sort(key=lambda x: x["score"], reverse=True)
+        filtered = all_sub_clips[:max(1, num_clips // 4)]
+        print(f"  Score threshold ({score_threshold}): no clips qualify, keeping top {len(filtered)}")
     else:
-        filtered.sort(key=lambda x: x["score"], reverse=True)
-        # Apply diversity filter to spread clips across timeline
-        if total_duration > 0:
-            filtered = _diversity_filter(filtered, num_clips, total_duration)
-        else:
-            filtered = filtered[:num_clips]
+        print(f"  Score threshold ({score_threshold}): {before} → {len(filtered)} clip(s)")
 
+    # Step 5: Diversity filter
+    before = len(filtered)
+    filtered.sort(key=lambda x: x["score"], reverse=True)
+    if total_duration > 0:
+        filtered = _diversity_filter(filtered, num_clips, total_duration)
+    else:
+        filtered = filtered[:num_clips]
+    print(f"  Diversity filter: {before} → {len(filtered)} clip(s)")
+
+    # Step 6: Deduplication
+    before = len(filtered)
+    filtered = _deduplicate_clips(filtered)
+    print(f"  Dedup: {before} → {len(filtered)} clip(s)")
+
+    # Step 7: Min duration expansion
+    before = len(filtered)
+    filtered = _expand_short_clips(filtered, min_duration)
+    print(f"  Min duration expansion ({min_duration}s): {before} → {len(filtered)} clip(s)")
+
+    # Step 8: Sort by start and resolve overlaps
     filtered.sort(key=lambda x: x["start"])
-
-    # Resolve overlaps between consecutive clips (from min-duration extension)
     for i in range(1, len(filtered)):
         prev = filtered[i-1]
         curr = filtered[i]
         if curr["start"] < prev["end"]:
-            overlap_start = curr["start"]
-            overlap_end = min(prev["end"], curr["end"])
-            mid = (overlap_start + overlap_end) / 2
+            mid = (prev["end"] + curr["start"]) / 2
             if prev["end"] > mid:
                 prev["end"] = mid
                 prev["duration"] = prev["end"] - prev["start"]
             if curr["start"] < mid:
                 curr["start"] = mid
                 curr["duration"] = curr["end"] - curr["start"]
-            print(f"         Перекрытие разрешено: разрез по {_format_time(mid)}")
+            print(f"  Перекрытие разрешено: разрез по {_format_time(mid)}")
 
-    found_clips = filtered
-    print(f"  Total: {len(found_clips)} clips ready (score ≥ {score_threshold})")
-    return found_clips
+    elapsed = time.time() - total_start
+    print(f"\n✓ {len(filtered)} clip(s) selected in {elapsed:.0f}s")
+    return filtered
 
 
 # ---------------------------------------------------------------------------
 # Diversity filter — spread selected clips across the movie timeline
 # ---------------------------------------------------------------------------
 
-def _diversity_filter(scenes, num_clips, total_duration):
+def _diversity_filter(scenes, num_clips, total_duration, min_score=7.0):
     """Spread selected clips across the movie timeline.
 
     Divides the movie into num_clips segments and picks the best scene
@@ -555,6 +693,7 @@ def _diversity_filter(scenes, num_clips, total_duration):
         scenes: list of {start, end, score, ...} sorted by score desc
         num_clips: max number of clips to return
         total_duration: total movie duration in seconds
+        min_score: minimum score for a scene to be a segment candidate (default 7.0)
 
     Returns:
         list of scenes sorted by start time, max num_clips entries
@@ -573,6 +712,7 @@ def _diversity_filter(scenes, num_clips, total_duration):
         candidates = [
             (i, s) for i, s in enumerate(scenes)
             if seg_start <= s["start"] < seg_end and i not in used_indices
+            and s["score"] >= min_score
         ]
         candidates.sort(key=lambda x: x[1]["score"], reverse=True)
         if candidates:
@@ -591,6 +731,26 @@ def _diversity_filter(scenes, num_clips, total_duration):
 
     selected.sort(key=lambda x: x["start"])
     return selected
+
+
+def _deduplicate_clips(clips, min_gap=120.0):
+    sorted_clips = sorted(clips, key=lambda x: x["start"])
+    kept = []
+    for clip in sorted_clips:
+        if not kept:
+            kept.append(clip)
+            continue
+        gap = clip["start"] - kept[-1]["start"]
+        if gap < min_gap:
+            if clip["score"] > kept[-1]["score"]:
+                removed = kept.pop()
+                print(f"🗑️ Клип «{removed.get('title','')}» удалён (дубликат {clip.get('title','')}, дистанция {gap:.0f}s)")
+                kept.append(clip)
+            else:
+                print(f"🗑️ Клип «{clip.get('title','')}» удалён (дубликат {kept[-1].get('title','')}, дистанция {gap:.0f}s)")
+        else:
+            kept.append(clip)
+    return kept
 
 
 # ---------------------------------------------------------------------------

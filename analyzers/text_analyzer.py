@@ -70,7 +70,7 @@ def _call_gemini_api(prompt_text: str, api_key: str, max_tokens: int = 256) -> s
     quota_exhausted = False
     for attempt in range(3):
         try:
-            resp = httpx.post(url, json=body, headers=headers, timeout=30)
+            resp = httpx.post(url, json=body, headers=headers, timeout=120)
             if resp.status_code == 429:
                 if attempt < 2:
                     wait = 5 * (attempt + 1)
@@ -129,7 +129,7 @@ def _call_yandex_api(prompt_text: str, api_key: str = "", max_tokens: int = 256,
     quota_exhausted = False
     for attempt in range(3):
         try:
-            resp = httpx.post(url, json=body, headers=headers, timeout=30)
+            resp = httpx.post(url, json=body, headers=headers, timeout=120)
             if resp.status_code == 429:
                 if attempt < 2:
                     time.sleep(5 * (attempt + 1))
@@ -509,6 +509,206 @@ def _parse_context_response(raw: str) -> list[dict]:
             idx += 1
 
     return scenes
+
+
+# ---------------------------------------------------------------------------
+# Block-to-Clips prompt + parser (C2 input)
+# ---------------------------------------------------------------------------
+
+PROMPT_BLOCK_TO_CLIPS = (
+    "Ты эксперт по нарезке фильмов на YouTube Shorts.\n"
+    "Фильм: «{movie_name}»\n\n"
+    "Диалог блока:\n\n{dialogue}\n\n"
+    "Длительность блока: {block_duration} секунд.\n"
+    "Количество смен кадра: {cut_count} (высокое = экшн, много действий).\n"
+    "Паузы в диалоге (секунды от начала блока): {pause_points}\n\n"
+    "Определи, какие клипы из этого блока подойдут для YouTube Shorts.\n\n"
+    "Правила:\n"
+    "- Каждый клип: 30-75 секунд. Предпочтительно ~60 секунд.\n"
+    "- Клипы < 20 секунд допускаются ТОЛЬКО если reason=\"самодостаточен\"\n"
+    "  (законченная шутка, реплика-клипса, яркий момент).\n"
+    "- start и end — ВРЕМЯ ОТ НАЧАЛА БЛОКА (не от начала фильма).\n"
+    "- Клипы НЕ должны пересекаться.\n"
+    "- Сколько клипов вернуть — реши сам. 1-3 обычно достаточно.\n"
+    "- Если блок неинтересен — верни пустой массив [].\n\n"
+    "Формат ответа (строго JSON-массив, без пояснений):\n"
+    '[{{"start": 0.0, "end": 60.0, "title": "Название", "score": 8.5, "reason": "описание"}}]\n\n'
+    "Примеры:\n"
+    '[{{"start": 0.0, "end": 55.0, "title": "Хэнкок спасает кита", "score": 9.0, "reason": "культовая сцена"}},\n'
+    ' {{"start": 55.0, "end": 110.0, "title": "Разговор в участке", "score": 6.5, "reason": "юмор в диалоге"}}]'
+)
+
+
+PROMPT_BLOCK_TO_CLIPS_EN = (
+    "You are an expert at cutting movie blocks into YouTube Shorts.\n"
+    "Movie: «{movie_name}»\n\n"
+    "Block dialogue:\n\n{dialogue}\n\n"
+    "Block duration: {block_duration} seconds.\n"
+    "Cut count (scene changes): {cut_count} (high = action, many events).\n"
+    "Dialogue pauses (seconds from block start): {pause_points}\n\n"
+    "Determine which clips from this block are suitable for YouTube Shorts.\n\n"
+    "Rules:\n"
+    "- Each clip: 30-75 seconds. Prefer ~60 seconds.\n"
+    "- Clips < 20 seconds are allowed ONLY with reason=\"self_contained\"\n"
+    "  (complete joke, quotable line, self-sufficient moment).\n"
+    "- start/end are RELATIVE TO BLOCK START (not movie start).\n"
+    "- Clips must NOT overlap.\n"
+    "- Decide how many clips to return. 1-3 is usually enough.\n"
+    "- If the block is uninteresting — return an empty array [].\n\n"
+    "Output format (strict JSON array, no explanations):\n"
+    '[{{"start": 0.0, "end": 60.0, "title": "Title", "score": 8.5, "reason": "description"}}]\n\n'
+    "Examples:\n"
+    '[{{"start": 0.0, "end": 55.0, "title": "Hancock saves a whale", "score": 9.0, "reason": "iconic scene"}},\n'
+    ' {{"start": 55.0, "end": 110.0, "title": "Station conversation", "score": 6.5, "reason": "dialogue humor"}}]'
+)
+
+
+# ---------------------------------------------------------------------------
+# Batch block-to-clips prompt — multiple blocks in one LLM call
+# ---------------------------------------------------------------------------
+
+PROMPT_BATCH_TO_CLIPS = (
+    "Ты эксперт по нарезке фильмов на YouTube Shorts.\n"
+    "Фильм: «{movie_name}»\n\n"
+    "Ниже перечислены блоки сцены. Для КАЖДОГО блока определи, какие клипы "
+    "подойдут для Shorts.\n"
+    "---\n"
+    "{blocks_text}\n"
+    "---\n\n"
+    "Правила (для каждого блока):\n"
+    "- Каждый клип: 30-75 секунд. Предпочтительно ~60 секунд.\n"
+    "- Клипы < 20 секунд допускаются ТОЛЬКО если reason=\"самодостаточен\"\n"
+    "  (законченная шутка, реплика-клипса, яркий момент).\n"
+    "- start и end — АБСОЛЮТНЫЕ секунды от НАЧАЛА ФИЛЬМА (не от блока).\n"
+    "- Клипы внутри ОДНОГО блока НЕ должны пересекаться.\n"
+    "- Сколько клипов на блок — реши сам. 1-3 обычно достаточно.\n"
+    "- Если блок неинтересен — не включай его клипы в ответ.\n\n"
+    "Формат ответа (строго JSON-массив, без пояснений):\n"
+    '[{{"start": 0.0, "end": 60.0, "title": "Название", "score": 8.5,\n'
+    '  "reason": "описание", "block": 0}}]\n\n'
+    'Поле "block" — 0-based индекс блока (0, 1, 2, 3...).\n'
+    "Пример:\n"
+    '[{{"start": 5.0, "end": 60.0, "title": "Тони собирает броню", "score": 9.0,\n'
+    '  "reason": "культовая сцена", "block": 0}},\n'
+    ' {{"start": 130.0, "end": 185.0, "title": "Разговор в башне", "score": 7.0,\n'
+    '  "reason": "диалог", "block": 1}}]'
+)
+
+PROMPT_BATCH_TO_CLIPS_EN = (
+    "You are an expert at cutting movie blocks into YouTube Shorts.\n"
+    "Movie: «{movie_name}»\n\n"
+    "Below are scene blocks. For EACH block, determine which clips "
+    "are suitable for Shorts.\n"
+    "---\n"
+    "{blocks_text}\n"
+    "---\n\n"
+    "Rules (per block):\n"
+    "- Each clip: 30-75 seconds. Prefer ~60 seconds.\n"
+    "- Clips < 20 seconds are allowed ONLY with reason=\"self_contained\"\n"
+    "  (complete joke, quotable line, self-sufficient moment).\n"
+    "- start/end are ABSOLUTE seconds from MOVIE START (not block-relative).\n"
+    "- Clips within ONE block must NOT overlap.\n"
+    "- Decide how many clips per block. 1-3 is usually enough.\n"
+    "- If a block is uninteresting — don't include its clips.\n\n"
+    "Output format (strict JSON array, no explanations):\n"
+    '[{{"start": 0.0, "end": 60.0, "title": "Title", "score": 8.5,\n'
+    '  "reason": "description", "block": 0}}]\n\n'
+    'Field "block" is 0-based block index (0, 1, 2, 3...).\n'
+    "Example:\n"
+    '[{{"start": 5.0, "end": 60.0, "title": "Tony suits up", "score": 9.0,\n'
+    '  "reason": "iconic scene", "block": 0}},\n'
+    ' {{"start": 130.0, "end": 185.0, "title": "Tower talk", "score": 7.0,\n'
+    '  "reason": "dialogue", "block": 1}}]'
+)
+
+
+def _parse_batch_response(raw: str, block_start_times: list[float]) -> dict[int, list[dict]]:
+    """Parse batch LLM response into per-block clip lists.
+
+    Expects a JSON array with each item having "block" field (int).
+
+    Args:
+        raw: raw LLM response text
+        block_start_times: list of block start times (seconds from film start)
+
+    Returns:
+        dict mapping block_index -> list of clip dicts (with absolute timestamps)
+    """
+    if not raw:
+        return {}
+
+    try:
+        clips = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        clips = []
+
+    if not isinstance(clips, list):
+        return {}
+
+    result: dict[int, list[dict]] = {}
+    for item in clips:
+        if not isinstance(item, dict):
+            continue
+        block_idx = item.get("block")
+        if not isinstance(block_idx, int):
+            continue
+        if block_idx < 0 or block_idx >= len(block_start_times):
+            continue
+        result.setdefault(block_idx, []).append(item)
+
+    return result
+
+
+def _parse_block_response(raw: str) -> list[dict]:
+    """Parse LLM response for block-to-clips分割.
+
+    Expects a JSON array of clip dicts: [{"start": float, "end": float, ...}].
+    Handles markdown code fences and falls back to regex extraction.
+
+    Returns list of clip dicts, or [] on failure.
+    """
+    if not raw or not isinstance(raw, str):
+        return []
+
+    content = raw.strip()
+    if not content:
+        return []
+
+    # 1. Try extracting from markdown code fence ```json [...] ```
+    fence_match = re.search(r'```(?:json)?\s*(\[.*?\])\s*```', content, re.DOTALL)
+    if fence_match:
+        try:
+            parsed = json.loads(fence_match.group(1))
+            if isinstance(parsed, list):
+                return parsed
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    # 2. Try direct JSON array extraction
+    direct_match = re.search(r'(\[.*?\])', content, re.DOTALL)
+    if direct_match:
+        try:
+            parsed = json.loads(direct_match.group(1))
+            if isinstance(parsed, list):
+                return parsed
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    # 3. Fallback: regex for individual clip objects
+    clip_pattern = (
+        r'\{\s*"start":\s*([\d.]+),\s*"end":\s*([\d.]+),'
+        r'\s*"title":\s*"([^"]*)",\s*"score":\s*([\d.]+)'
+    )
+    clips = []
+    for m in re.finditer(clip_pattern, content):
+        clips.append({
+            "start": float(m.group(1)),
+            "end": float(m.group(2)),
+            "title": m.group(3),
+            "score": float(m.group(4)),
+        })
+
+    return clips
 
 
 def ask_llm_context_mode(

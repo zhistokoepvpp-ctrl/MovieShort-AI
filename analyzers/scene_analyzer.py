@@ -2,6 +2,7 @@
 MovieShort AI — Scene detection and transcription analyzer.
 """
 import hashlib
+import json as _json
 import re
 import time as time_module
 import subprocess
@@ -20,6 +21,118 @@ def _cleanup_temp_audio(path: str) -> None:
             os.remove(path)
         except OSError:
             pass
+
+
+def _compute_audio_rms(video_path: str, audio_path: str) -> list:
+    """Compute RMS envelope (dBFS) from WAV audio, one value per 200ms window.
+
+    Reads the 16-bit PCM WAV directly via Python (no ffmpeg astats dependency),
+    properly parsing RIFF/WAV chunk structure to find the data chunk.
+    Returns list of dBFS values or [] on error.
+    """
+    import struct
+    import math
+    window_s = 0.2   # 200ms per window
+
+    try:
+        with open(audio_path, "rb") as f:
+            buf = f.read()
+    except (IOError, OSError):
+        return []
+
+    if len(buf) < 44:
+        return []
+
+    # Parse RIFF/WAV chunk structure to locate the "data" chunk
+    # WAV format: RIFF header (12 bytes) → chunks (type + size + data)
+    # fmt chunk is usually first, but we skip through all chunks
+    # to find the data chunk (can have LIST, fact, etc. in between)
+    pos = 12  # skip RIFF header (4 RIFF + 4 size + 4 WAVE)
+    sample_rate = 16000  # default fallback
+    data_start = -1
+    data_end = len(buf)
+
+    while pos < min(len(buf), 256):  # scan first 256 bytes for headers
+        if pos + 8 > len(buf):
+            break
+        chunk_id = buf[pos:pos + 4]
+        if len(chunk_id) < 4:
+            break
+        chunk_size = struct.unpack_from("<I", buf, pos + 4)[0]
+        chunk_data_start = pos + 8
+
+        if chunk_id == b"fmt ":
+            # fmt chunk: parse sample rate at offset 12 within chunk
+            if chunk_data_start + 16 <= len(buf):
+                sample_rate = struct.unpack_from("<I", buf, chunk_data_start + 4)[0]
+                channels = struct.unpack_from("<H", buf, chunk_data_start + 2)[0]
+        elif chunk_id == b"data":
+            data_start = chunk_data_start
+            data_end = chunk_data_start + chunk_size
+
+        # Move to next chunk (chunks are padded to 2 bytes)
+        pos = chunk_data_start + chunk_size
+        if pos % 2:
+            pos += 1
+
+    if data_start < 0:
+        return []  # no data chunk found
+
+    # Read raw PCM data (16-bit signed little-endian)
+    raw_pcm = buf[data_start:data_end]
+
+    # 16-bit PCM: 2 bytes per sample
+    bytes_per_sample = 2
+    window_samples = int(window_s * sample_rate)
+    if window_samples < 1:
+        window_samples = 3200  # fallback for 16kHz
+
+    window_bytes = window_samples * bytes_per_sample
+    max_bytes = len(raw_pcm) - (len(raw_pcm) % window_bytes)
+
+    rms_values = []
+    for offset in range(0, max_bytes, window_bytes):
+        chunk = raw_pcm[offset:offset + window_bytes]
+        n_samples = len(chunk) // bytes_per_sample
+        if n_samples < 1:
+            continue
+        samples = struct.unpack(f"<{n_samples}h", chunk)
+        sq_sum = sum(s * s for s in samples)
+        rms = math.sqrt(sq_sum / n_samples)
+        dbfs = 20.0 * math.log10(rms / 32767.0) if rms > 0 else -100.0
+        rms_values.append(dbfs)
+
+    return rms_values
+
+
+def _get_audio_rms(video_path, audio_path, language=None, model=None):
+    """Get per-200ms RMS values, using cache when available."""
+    if language is None:
+        language = config.WHISPER_LANGUAGE
+    if model is None:
+        model = config.WHISPER_MODEL
+
+    hash_input = f"{video_path}_{language}_{model}"
+    file_hash = hashlib.md5(hash_input.encode()).hexdigest()[:8]
+    cache_file = os.path.join(str(config.TEMP_DIR), f"_audio_rms_{file_hash}.json")
+
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, "r") as f:
+                return _json.load(f)
+        except Exception:
+            pass
+
+    rms = _compute_audio_rms(video_path, audio_path)
+
+    try:
+        os.makedirs(config.TEMP_DIR, exist_ok=True)
+        with open(cache_file, "w") as f:
+            _json.dump(rms, f)
+    except Exception:
+        pass
+
+    return rms
 from utils import fmt_duration as _fmt_duration
 from utils.ffmpeg_utils import _detect_gpu_accel
 from utils import get_video_basename
@@ -210,7 +323,9 @@ def get_scene_transcripts(video_path, scenes, language=None):
         print("  После установки перезапусти программу.")
         print()
         return [{"start": s["start"], "end": s["end"],
-                 "duration": s["end"] - s["start"], "text": ""}
+                 "duration": s["end"] - s["start"], "text": "",
+                 "audio_peaks": {"peak_rms": 0.0, "loud_peak_count": 0,
+                                 "silence_ratio": 1.0}}
                 for s in scenes]
     except Exception:
         print("  Audio duration: unknown")
@@ -231,6 +346,7 @@ def get_scene_transcripts(video_path, scenes, language=None):
             bufsize=1,
         )
 
+        extract_start_time = time_module.time()
         last_report = 0.0
         time_pattern = re.compile(r"time=(\d{2}):(\d{2}):(\d{2}\.\d+)")
         for stderr_line in proc.stderr:
@@ -242,10 +358,18 @@ def get_scene_transcripts(video_path, scenes, language=None):
                 now = time_module.time()
                 if now - last_report > 2.0:
                     last_report = now
+                    wall_elapsed = now - extract_start_time
                     if audio_duration > 0:
                         pct = current_sec / audio_duration * 100
+                        if current_sec > 0:
+                            speed = current_sec / max(wall_elapsed, 0.1)
+                            remaining_audio = audio_duration - current_sec
+                            eta = remaining_audio / speed
+                        else:
+                            eta = 0
                         print(f"  Audio extraction: {pct:.0f}%  "
-                              f"({_fmt_duration(current_sec)} / {_fmt_duration(audio_duration)})")
+                              f"elapsed {_fmt_duration(wall_elapsed)}  "
+                              f"ETA {_fmt_duration(eta)}")
                     else:
                         print(f"  Audio extraction: {_fmt_duration(current_sec)}...")
 
@@ -263,24 +387,41 @@ def get_scene_transcripts(video_path, scenes, language=None):
         print()
         _cleanup_temp_audio(temp_audio)
         return [{"start": s["start"], "end": s["end"],
-                 "duration": s["end"] - s["start"], "text": ""}
+                 "duration": s["end"] - s["start"], "text": "",
+                 "audio_peaks": {"peak_rms": 0.0, "loud_peak_count": 0,
+                                 "silence_ratio": 1.0}}
                 for s in scenes]
     except subprocess.TimeoutExpired:
         proc.kill()
         print("  Error: Audio extraction timed out (>15min)")
         _cleanup_temp_audio(temp_audio)
         return [{"start": s["start"], "end": s["end"],
-                 "duration": s["end"] - s["start"], "text": ""}
+                 "duration": s["end"] - s["start"], "text": "",
+                 "audio_peaks": {"peak_rms": 0.0, "loud_peak_count": 0,
+                                 "silence_ratio": 1.0}}
                 for s in scenes]
     except subprocess.CalledProcessError:
         print("  Warning: Could not extract audio")
         _cleanup_temp_audio(temp_audio)
         return [{"start": s["start"], "end": s["end"],
-                 "duration": s["end"] - s["start"], "text": ""}
+                 "duration": s["end"] - s["start"], "text": "",
+                 "audio_peaks": {"peak_rms": 0.0, "loud_peak_count": 0,
+                                 "silence_ratio": 1.0}}
                 for s in scenes]
     except BaseException:
         _cleanup_temp_audio(temp_audio)
         raise
+
+    # Compute audio RMS envelope (per-200ms window) — cached per film
+    print("Computing audio RMS envelope...")
+    try:
+        audio_rms = _get_audio_rms(video_path, temp_audio, language)
+    except Exception:
+        audio_rms = []
+    if audio_rms:
+        print(f"  Got {len(audio_rms)} RMS values ({len(audio_rms)/5:.1f}s of audio)")
+    else:
+        print("  RMS computation skipped or unavailable")
 
     # Transcribe full audio once (cached model)
     # (temp_audio is cleaned up inside _transcribe_audio_file)
@@ -301,7 +442,6 @@ def get_scene_transcripts(video_path, scenes, language=None):
     )
     save_segments_json(all_segments, transcript_json)
 
-    MIN_SCENE = config.MIN_SCENE_DURATION
     PAUSE_GAP = config.DIALOGUE_PAUSE_THRESHOLD
 
     # Map transcript segments to scenes by time overlap
@@ -317,44 +457,50 @@ def get_scene_transcripts(video_path, scenes, language=None):
                 overlapping.append(seg)
         overlapping.sort(key=lambda s: s["start"])
 
-        # Split scene at dialogue pauses > threshold
-        if len(overlapping) >= 2:
-            sub_groups = []
-            cur_group = [overlapping[0]]
-            for j in range(1, len(overlapping)):
-                gap = overlapping[j]["start"] - cur_group[-1]["end"]
-                if gap > PAUSE_GAP:
-                    sub_groups.append(cur_group)
-                    cur_group = [overlapping[j]]
-                else:
-                    cur_group.append(overlapping[j])
-            sub_groups.append(cur_group)
+        # Build ONE result per scene with advisory pause_points
+        scene_text = " ".join(s["text"] for s in overlapping).strip()
+        pause_points = []
+        for j in range(len(overlapping) - 1):
+            gap = overlapping[j + 1]["start"] - overlapping[j]["end"]
+            if gap > PAUSE_GAP:
+                pause_points.append({
+                    "gap_start": overlapping[j]["end"],
+                    "gap_end": overlapping[j + 1]["start"],
+                })
 
-            # Build result from each subgroup that meets min duration
-            for group in sub_groups:
-                sub_text = " ".join(s["text"] for s in group).strip()
-                if not sub_text:
-                    continue
-                sub_start = max(start_s, group[0]["start"])
-                sub_end = min(end_s, group[-1]["end"])
-                sub_dur = sub_end - sub_start
-                # Allow scenes slightly shorter than min_duration if they have dialogue
-                if sub_dur >= MIN_SCENE * 0.7:
-                    results.append({
-                        "start": sub_start,
-                        "end": sub_end,
-                        "duration": sub_dur,
-                        "text": sub_text,
-                    })
+        block = {
+            "start": start_s,
+            "end": end_s,
+            "duration": end_s - start_s,
+            "text": scene_text,
+            "pause_points": pause_points,
+        }
+
+        # Compute audio_peaks from RMS envelope (5 values/sec = 200ms windows)
+        if audio_rms:
+            start_idx = int(start_s * 5)
+            end_idx = int(end_s * 5)
+            block_rms = audio_rms[max(0, start_idx):end_idx]
+            if block_rms:
+                peak_rms = max(block_rms)
+                loud_peak_count = sum(1 for v in block_rms if v > -20)
+                silence_ratio = sum(1 for v in block_rms if v < -50) / len(block_rms)
+            else:
+                peak_rms = 0.0
+                loud_peak_count = 0
+                silence_ratio = 1.0
         else:
-            # Single segment or none — use scene as-is
-            scene_text = " ".join(s["text"] for s in overlapping).strip()
-            results.append({
-                "start": start_s,
-                "end": end_s,
-                "duration": end_s - start_s,
-                "text": scene_text,
-            })
+            peak_rms = 0.0
+            loud_peak_count = 0
+            silence_ratio = 1.0
+        block["audio_peaks"] = {
+            "peak_rms": peak_rms,
+            "loud_peak_count": loud_peak_count,
+            "silence_ratio": silence_ratio,
+        }
+        if "cut_count" in scene:
+            block["cut_count"] = scene["cut_count"]
+        results.append(block)
 
         if (i + 1) % 20 == 0:
             print(f"  Mapped {i+1}/{len(scenes)} scenes to transcripts")
@@ -374,6 +520,12 @@ def detect_and_transcribe(video_path, language=None):
     """
     scenes = detect_scenes(video_path)
     merged = merge_short_scenes(scenes)
+
+    for m in merged:
+        m["cut_count"] = sum(
+            1 for r in scenes
+            if r["start"] >= m["start"] and r["end"] <= m["end"]
+        )
 
     if not merged:
         # Fallback: whole video as one scene

@@ -3,6 +3,7 @@ MovieShort AI — Faster-Whisper subtitle generation module.
 """
 import subprocess
 import os
+import time as time_module
 import warnings
 from pathlib import Path
 
@@ -131,6 +132,7 @@ def _transcribe_audio_file(audio_path, language, progress_callback=None):
 
     segments = []
     last_report_pct = 0
+    transcribe_start = time_module.time()
 
     try:
         seg_gen, info = model.transcribe(
@@ -161,9 +163,16 @@ def _transcribe_audio_file(audio_path, language, progress_callback=None):
                 pct = min(100, int(seg.end / total_duration * 100))
                 if pct >= last_report_pct + 5:
                     last_report_pct = (pct // 5) * 5
-                    elapsed_fmt = _fmt_duration(seg.end)
-                    total_fmt = _fmt_duration(total_duration)
-                    msg = f"  Transcribing: {last_report_pct}%  ({elapsed_fmt} / {total_fmt})"
+                    wall_elapsed = time_module.time() - transcribe_start
+                    processed = seg.end
+                    if processed > 0 and wall_elapsed > 0:
+                        speed = processed / wall_elapsed
+                        remaining = total_duration - processed
+                        eta = remaining / speed
+                        eta_str = _fmt_duration(eta)
+                    else:
+                        eta_str = "?"
+                    msg = f"  Transcribing: {last_report_pct}%  elapsed {_fmt_duration(wall_elapsed)}  ETA {eta_str}"
                     print(msg)
                     if progress_callback:
                         progress_callback(pct / 100.0, msg)
