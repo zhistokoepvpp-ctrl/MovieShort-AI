@@ -9,9 +9,10 @@ from pathlib import Path
 
 import config
 from utils.ffmpeg_utils import (
-    clip_video, extract_audio, embed_subtitles,
+    clip_video, embed_subtitles,
     convert_to_vertical, FFmpegError,
     pad_with_banners, blur_background,
+    _detect_gpu_accel,
 )
 from core.subtitle import (
     transcribe, generate_srt, generate_word_group_srt,
@@ -63,6 +64,7 @@ def process_clip(video_path, start_time, end_time, options=None, title=""):
     banner_top = options.get("banner_top", config.DEFAULT_BANNER_TOP)
     banner_bottom = options.get("banner_bottom", config.DEFAULT_BANNER_BOTTOM)
     font_style = options.get("font_style")
+    gpu_opts = _detect_gpu_accel()
 
     video_path = str(video_path)
     os.makedirs(config.TEMP_DIR, exist_ok=True)
@@ -83,10 +85,13 @@ def process_clip(video_path, start_time, end_time, options=None, title=""):
     vertical_clip = str(config.TEMP_DIR / f"{clip_name}_vert.mp4")
     final_output = str(config.OUTPUT_DIR / f"{clip_name}.mp4")
 
+    # Initialize subtitled_clip before try so finally can reference it safely
+    subtitled_clip = vertical_clip
+
     try:
         # Step 1: Cut the segment
         print(f"[1/5] Cutting {start_time} - {end_time}...")
-        clip_video(video_path, start_time, end_time, raw_clip)
+        clip_video(video_path, start_time, end_time, raw_clip, gpu_opts=gpu_opts)
 
         # Step 2: Generate subtitles
         if subtitles_enabled:
@@ -141,16 +146,16 @@ def process_clip(video_path, start_time, end_time, options=None, title=""):
                 anti_copyright=anti_copyright,
                 banner_top=banner_top,
                 banner_bottom=banner_bottom,
+                gpu_opts=gpu_opts,
             )
 
         # Step 4: Embed subtitles (on content-area video, before banner padding)
-        subtitled_clip = vertical_clip
         if subtitles_enabled and os.path.exists(srt_path):
             print("[4/5] Embedding subtitles...")
             subtitled_clip = str(config.TEMP_DIR / f"{clip_name}_subs.mp4")
             embed_subtitles(vertical_clip, srt_path, subtitled_clip,
                            font_style=font_style, banner_top=banner_top,
-                           banner_bottom=banner_bottom)
+                           banner_bottom=banner_bottom, gpu_opts=gpu_opts)
         else:
             print("[4/5] Skipping subtitle embed...")
 
@@ -158,12 +163,14 @@ def process_clip(video_path, start_time, end_time, options=None, title=""):
         if blur_enabled:
             print("[5/5] Adding blurred background...")
             blur_background(subtitled_clip, final_output,
-                          enabled=True, banner_top=banner_top, banner_bottom=banner_bottom)
+                          enabled=True, banner_top=banner_top, banner_bottom=banner_bottom,
+                          gpu_opts=gpu_opts)
         else:
             print("[5/5] Padding to full frame (no blur)...")
             # If blur disabled, pad the content-area video to full 9:16
             pad_with_banners(subtitled_clip, final_output,
-                           banner_top=banner_top, banner_bottom=banner_bottom)
+                           banner_top=banner_top, banner_bottom=banner_bottom,
+                           gpu_opts=gpu_opts)
 
         print(f"Done! → {final_output}")
         return final_output
@@ -180,8 +187,7 @@ def process_clip(video_path, start_time, end_time, options=None, title=""):
     finally:
         # Cleanup temp files
         cleanup_files = [raw_clip, clip_with_audio, srt_path, vertical_clip]
-        # subtitled_clip may be same as vertical_clip (if subs skipped)
-        if 'subtitled_clip' in dir() and subtitled_clip != vertical_clip:
+        if subtitled_clip != vertical_clip:
             cleanup_files.append(subtitled_clip)
         for f in cleanup_files:
             if os.path.exists(f):
@@ -191,26 +197,61 @@ def process_clip(video_path, start_time, end_time, options=None, title=""):
                     pass
 
 
-def process_multiple(video_path, timestamps_list, options=None):
+def process_multiple(video_path, timestamps_list, options=None, titles=None, max_workers=2):
     """
-    Process multiple clips from one video.
+    Process multiple clips from one video using parallel workers.
 
     Args:
         video_path: path to source video
         timestamps_list: list of (start_time, end_time) tuples
         options: dict of options (passed to process_clip)
+        titles: optional list of scene titles (same length as timestamps_list)
+        max_workers: max parallel workers (default 2, 1 = sequential)
 
     Returns:
         List of paths to output files.
     """
-    results = []
-    total = len(timestamps_list)
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    for i, (start, end) in enumerate(timestamps_list):
-        print(f"\n--- Clip {i+1}/{total}: {start} - {end} ---")
-        result = process_clip(video_path, start, end, options)
-        results.append(result)
+    total = len(timestamps_list)
+    if total == 0:
+        return []
+
+    if titles is None:
+        titles = [""] * total
+
+    if max_workers <= 1:
+        # Sequential mode
+        results = []
+        for i, (start, end) in enumerate(timestamps_list):
+            print(f"\n--- Clip {i+1}/{total}: {start} - {end} ---")
+            result = process_clip(video_path, start, end, options, title=titles[i])
+            results.append(result)
+        done = sum(1 for r in results if r is not None)
+        print(f"\nDone: {done}/{total} clips processed")
+        return results
+
+    # Parallel mode
+    print(f"\nProcessing {total} clips with max_workers={max_workers}...")
+    results = [None] * total
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_idx = {}
+        for i, (start, end) in enumerate(timestamps_list):
+            future = executor.submit(process_clip, video_path, start, end, options, title=titles[i])
+            future_to_idx[future] = i
+
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            try:
+                result = future.result()
+                results[idx] = result
+                status = "✅" if result else "❌"
+                print(f"  Clip {idx+1}/{total} {status}")
+            except Exception as e:
+                print(f"  Clip {idx+1}/{total} ❌ failed: {e}")
+                results[idx] = None
 
     done = sum(1 for r in results if r is not None)
-    print(f"\nDone: {done}/{total} clips processed")
+    print(f"\nDone: {done}/{total} clips processed (parallel)")
     return results

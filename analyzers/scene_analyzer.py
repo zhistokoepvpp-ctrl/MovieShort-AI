@@ -11,8 +11,18 @@ from scenedetect import open_video, SceneManager, ContentDetector
 
 from core.subtitle import transcribe, _transcribe_audio_file
 import config
+
+
+def _cleanup_temp_audio(path: str) -> None:
+    """Safely remove temp audio file if it exists."""
+    if path and os.path.exists(path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 from utils import fmt_duration as _fmt_duration
 from utils.ffmpeg_utils import _detect_gpu_accel
+from utils import get_video_basename
 # _fmt_duration is imported from utils — no local definition needed
 
 
@@ -57,14 +67,16 @@ def detect_scenes(video_path, threshold=None):
     start_time = time_module.time()
     CHECK_INTERVAL = max(500, frames_to_process // 40)  # ~40 updates
 
+    done_flag = False
+
     def progress_callback(frame: "np.ndarray", frame_number: int) -> None:
-        nonlocal start_time, CHECK_INTERVAL, frames_to_process
+        nonlocal start_time, CHECK_INTERVAL, frames_to_process, done_flag
         if frame_number % CHECK_INTERVAL == 0 and frame_number > 0:
             elapsed = time_module.time() - start_time
             frames_done = min(frame_number, frames_to_process)
             pct = min(100.0, frames_done / frames_to_process * 100)
             # Skip if already at 100% (avoids repeated prints when estimate is exceeded)
-            if pct >= 100.0 and hasattr(progress_callback, "_done"):
+            if pct >= 100.0 and done_flag:
                 return
             rate = frames_done / max(elapsed, 0.1)
             remaining_frames = max(0, frames_to_process - frames_done)
@@ -73,7 +85,7 @@ def detect_scenes(video_path, threshold=None):
                   f"elapsed: {_fmt_duration(elapsed)}  "
                   f"ETA: {_fmt_duration(remaining)}")
             if pct >= 100.0:
-                progress_callback._done = True
+                done_flag = True
 
     print("Starting frame scan...")
     scene_manager.detect_scenes(
@@ -249,22 +261,29 @@ def get_scene_transcripts(video_path, scenes, language=None):
         print("  Или через winget (админ): winget install FFmpeg")
         print("  После установки перезапусти программу.")
         print()
+        _cleanup_temp_audio(temp_audio)
         return [{"start": s["start"], "end": s["end"],
                  "duration": s["end"] - s["start"], "text": ""}
                 for s in scenes]
     except subprocess.TimeoutExpired:
         proc.kill()
         print("  Error: Audio extraction timed out (>15min)")
+        _cleanup_temp_audio(temp_audio)
         return [{"start": s["start"], "end": s["end"],
                  "duration": s["end"] - s["start"], "text": ""}
                 for s in scenes]
     except subprocess.CalledProcessError:
         print("  Warning: Could not extract audio")
+        _cleanup_temp_audio(temp_audio)
         return [{"start": s["start"], "end": s["end"],
                  "duration": s["end"] - s["start"], "text": ""}
                 for s in scenes]
+    except BaseException:
+        _cleanup_temp_audio(temp_audio)
+        raise
 
     # Transcribe full audio once (cached model)
+    # (temp_audio is cleaned up inside _transcribe_audio_file)
     print()
     print("Starting Whisper transcription...")
     all_segments = _transcribe_audio_file(temp_audio, language)
@@ -273,7 +292,7 @@ def get_scene_transcripts(video_path, scenes, language=None):
 
     # Save full transcript to JSON for reuse across clips
     from core.subtitle import save_segments_json
-    video_basename = os.path.basename(str(video_path)).split('.')[0]
+    video_basename = get_video_basename(video_path)
     hash_input = f"{video_path}_{language}_{config.WHISPER_MODEL}"
     file_hash = hashlib.md5(hash_input.encode()).hexdigest()[:8]
     transcript_json = os.path.join(

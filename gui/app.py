@@ -406,6 +406,79 @@ def _make_progress_html(pct: float, label: str = "") -> str:
 </div>"""
 
 
+def _check_for_update():
+    """Check GitHub for newer release. Returns banner HTML or empty string."""
+    try:
+        import httpx
+        import html as html_mod
+        resp = httpx.get(
+            "https://api.github.com/repos/zhistokoepvpp-ctrl/MovieShort-AI/releases/latest",
+            timeout=5,
+        )
+        if resp.status_code != 200:
+            return ""
+
+        data = resp.json()
+        tag_name = data.get("tag_name", "")
+        if not tag_name.startswith("v"):
+            return ""
+
+        remote_ver = tag_name.lstrip("v")
+        local_ver = getattr(app_config, "APP_VERSION", "0.0.0")
+
+        remote_parts = [int(x) for x in remote_ver.split(".")]
+        local_parts = [int(x) for x in local_ver.split(".")]
+        while len(remote_parts) < 3:
+            remote_parts.append(0)
+        while len(local_parts) < 3:
+            local_parts.append(0)
+
+        if remote_parts <= local_parts:
+            return ""
+
+        html_url = data.get("html_url", "#")
+        body = data.get("body", "")[:300]
+
+        safe_tag = html_mod.escape(tag_name)
+        safe_body = html_mod.escape(body[:200].strip())
+        safe_url = html_mod.escape(html_url)
+
+        return f"""<div id="update-banner" style="
+background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);
+color:white;padding:14px 20px;border-radius:10px;
+margin-bottom:16px;display:flex;align-items:center;
+justify-content:space-between;flex-wrap:wrap;gap:10px;
+box-shadow:0 4px 15px rgba(102,126,234,0.4);
+">
+<div style="display:flex;align-items:center;gap:12px;flex:1;min-width:200px;">
+    <span style="font-size:24px;">🎬</span>
+    <div>
+        <div style="font-weight:bold;font-size:15px;">
+            Доступна новая версия {safe_tag}
+        </div>
+        <div style="font-size:13px;opacity:0.9;margin-top:2px;">
+            {safe_body}
+        </div>
+    </div>
+</div>
+<div style="display:flex;gap:8px;align-items:center;">
+    <a href="{safe_url}" target="_blank"
+       style="display:inline-block;padding:8px 20px;
+              background:white;color:#667eea;border-radius:6px;
+              text-decoration:none;font-weight:600;font-size:14px;">
+        👀 Смотреть
+    </a>
+    <button onclick="this.parentElement.parentElement.style.display='none'"
+            style="background:transparent;color:white;border:1px solid rgba(255,255,255,0.5);
+                   border-radius:6px;padding:8px 12px;cursor:pointer;font-size:16px;">
+        ✕
+    </button>
+</div>
+</div>"""
+    except Exception:
+        return ""
+
+
 def create_app() -> gr.Blocks:
     # Load persisted settings
     cfg = user_config.load()
@@ -444,6 +517,11 @@ def create_app() -> gr.Blocks:
   </a>
 </div>"""
             )
+
+        # Update notification banner (checked synchronously at startup)
+        _banner_html = _check_for_update()
+        if _banner_html:
+            gr.HTML(value=_banner_html)
 
         with gr.Tabs():
             # ── Tab 1: Manual ──────────────────────────────────

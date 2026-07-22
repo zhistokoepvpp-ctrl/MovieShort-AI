@@ -3,7 +3,6 @@ MovieShort AI — FFmpeg utilities
 """
 from pathlib import Path
 from typing import Optional, Union
-import json
 import re
 import shutil
 import subprocess
@@ -15,7 +14,54 @@ class FFmpegError(Exception):
     """Raised when an FFmpeg/FFprobe command fails."""
 
 
-_TIME_RE = re.compile(r"^\d{2}:\d{2}:\d{2}$")
+_GPU_ACCEL = None  # cached result
+
+def _detect_gpu_accel():
+    """Detect NVIDIA GPU availability for FFmpeg HW acceleration.
+    
+    Returns dict with hwaccel config or None if unavailable.
+    Caches result in module global.
+    """
+    global _GPU_ACCEL
+    if _GPU_ACCEL is not None:
+        return _GPU_ACCEL
+    
+    try:
+        # Check nvidia-smi
+        subprocess.run(["nvidia-smi"], capture_output=True, text=True, timeout=5, check=True)
+        # Check FFmpeg NVENC encoder
+        encoders = subprocess.run(
+            ["ffmpeg", "-encoders"], capture_output=True, text=True, timeout=10
+        )
+        has_nvenc = "nvenc" in encoders.stdout
+        # Check FFmpeg NVDEC decoder
+        decoders = subprocess.run(
+            ["ffmpeg", "-decoders"], capture_output=True, text=True, timeout=10
+        )
+        has_nvdec = "nvdec" in decoders.stdout
+        
+        if has_nvenc and has_nvdec:
+            _GPU_ACCEL = {"hwaccel": "cuda", "encoder": "h264_nvenc", "decoder": "h264_cuvid"}
+            print("  GPU acceleration detected: NVENC+NVDEC available")
+            return _GPU_ACCEL
+        else:
+            _GPU_ACCEL = None
+            return None
+    except (subprocess.SubprocessError, FileNotFoundError):
+        _GPU_ACCEL = None
+        return None
+
+
+def _gpu_args(gpu_opts=None):
+    """Build FFmpeg GPU acceleration arguments if available."""
+    if gpu_opts is None:
+        gpu_opts = _detect_gpu_accel()
+    if gpu_opts:
+        return ["-hwaccel", gpu_opts["hwaccel"], "-hwaccel_output_format", gpu_opts["hwaccel"]]
+    return []
+
+
+_TIME_RE = re.compile(r"^\d{2}:\d{2}:\d{2}(\.\d+)?$")
 
 
 def _validate_time(time_str: str, name: str) -> None:
@@ -23,7 +69,9 @@ def _validate_time(time_str: str, name: str) -> None:
         raise ValueError(
             f"{name} must be in HH:MM:SS format, got {time_str!r}"
         )
-    h, m, s = int(time_str[:2]), int(time_str[3:5]), int(time_str[6:8])
+    h, m, s_part = int(time_str[:2]), int(time_str[3:5]), time_str[6:]
+    # s_part could be "ss" or "ss.fff"
+    s = int(float(s_part))
     if h > 23 or m > 59 or s > 59:
         raise ValueError(
             f"{name} has invalid time values "
@@ -62,23 +110,24 @@ def clip_video(
     start_time: str,
     end_time: str,
     output_path: Union[str, Path],
+    gpu_opts=None,
 ) -> Path:
     _validate_file(input_path, "input_path")
     _validate_time(start_time, "start_time")
     _validate_time(end_time, "end_time")
     out = Path(output_path)
-    _run(
-        [
-            "ffmpeg", "-y",
-            "-ss", start_time,
-            "-to", end_time,
-            "-i", str(input_path),
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-            "-c:a", "aac",
-            str(out),
-        ],
-        desc="clip_video",
-    )
+    gpu = _gpu_args(gpu_opts)
+    cmd = ["ffmpeg", "-y"]
+    if gpu:
+        # GPU: -hwaccel before -i, input seeking (-ss before -i), nvenc encoder
+        cmd.extend(gpu)
+    cmd.extend(["-ss", start_time, "-to", end_time, "-i", str(input_path)])
+    if gpu:
+        cmd.extend(["-c:v", gpu_opts["encoder"], "-preset", "p1", "-cq", "23"])
+    else:
+        cmd.extend(["-c:v", "libx264", "-preset", "veryfast", "-crf", "23"])
+    cmd.extend(["-c:a", "aac", str(out)])
+    _run(cmd, desc="clip_video")
     return out
 
 
@@ -89,6 +138,7 @@ def embed_subtitles(
     font_style: Optional[dict] = None,
     banner_top: int = BANNER_TOP,
     banner_bottom: int = BANNER_BOTTOM,
+    gpu_opts=None,
 ) -> Path:
     _validate_file(video_path, "video_path")
     _validate_file(subtitle_path, "subtitle_path")
@@ -122,17 +172,17 @@ def embed_subtitles(
     filter_str = (
         "subtitles={}:force_style='{}':original_size=1080x{}"
     ).format(local_srt.name, style, content_h)
-    _run(
-        [
-            "ffmpeg", "-y",
-            "-i", str(video_path),
-            "-vf", filter_str,
-            "-c:a", "copy",
-            str(out),
-        ],
-        desc="embed_subtitles",
-        cwd=out_dir,
-    )
+    gpu = _gpu_args(gpu_opts)
+    cmd = ["ffmpeg", "-y"]
+    if gpu:
+        cmd.extend(gpu)
+    cmd.extend([
+        "-i", str(video_path),
+        "-vf", filter_str,
+        "-c:a", "copy",
+        str(out),
+    ])
+    _run(cmd, desc="embed_subtitles", cwd=out_dir)
     # Clean up the temporary SRT copy
     local_srt.unlink(missing_ok=True)
     return out
@@ -141,13 +191,10 @@ def embed_subtitles(
 def convert_to_vertical(
     video_path: Union[str, Path],
     output_path: Union[str, Path],
-    crop_x: int = 0,
-    crop_y: int = 0,
-    crop_w: int = 0,
-    crop_h: int = 0,
     anti_copyright: bool = True,
     banner_top: int = BANNER_TOP,
     banner_bottom: int = BANNER_BOTTOM,
+    gpu_opts=None,
 ) -> Path:
     """Scale video to fill the content area, cropping overflow.
 
@@ -173,16 +220,17 @@ def convert_to_vertical(
     ).format(VERTICAL_WIDTH, content_h,
              VERTICAL_WIDTH, content_h,
              ac_part)
-    _run(
-        [
-            "ffmpeg", "-y",
-            "-i", str(video_path),
-            "-vf", filter_str,
-            "-c:a", "copy",
-            str(out),
-        ],
-        desc="convert_to_vertical",
-    )
+    gpu = _gpu_args(gpu_opts)
+    cmd = ["ffmpeg", "-y"]
+    if gpu:
+        cmd.extend(gpu)
+    cmd.extend([
+        "-i", str(video_path),
+        "-vf", filter_str,
+        "-c:a", "copy",
+        str(out),
+    ])
+    _run(cmd, desc="convert_to_vertical")
     return out
 
 
@@ -192,6 +240,7 @@ def blur_background(
     enabled: bool = True,
     banner_top: int = BANNER_TOP,
     banner_bottom: int = BANNER_BOTTOM,
+    gpu_opts=None,
 ) -> Path:
     """Blurred background effect: fills 1080×1920 with blurred video, clear fg centered.
 
@@ -214,16 +263,17 @@ def blur_background(
     ).format(VERTICAL_WIDTH, VERTICAL_HEIGHT,
              VERTICAL_WIDTH, VERTICAL_HEIGHT,
              banner_top)
-    _run(
-        [
-            "ffmpeg", "-y",
-            "-i", str(video_path),
-            "-filter_complex", filter_complex,
-            "-c:a", "copy",
-            str(out),
-        ],
-        desc="blur_background",
-    )
+    gpu = _gpu_args(gpu_opts)
+    cmd = ["ffmpeg", "-y"]
+    if gpu:
+        cmd.extend(gpu)
+    cmd.extend([
+        "-i", str(video_path),
+        "-filter_complex", filter_complex,
+        "-c:a", "copy",
+        str(out),
+    ])
+    _run(cmd, desc="blur_background")
     return out
 
 
@@ -232,6 +282,7 @@ def pad_with_banners(
     output_path: Union[str, Path],
     banner_top: int = BANNER_TOP,
     banner_bottom: int = BANNER_BOTTOM,
+    gpu_opts=None,
 ) -> Path:
     """Pad a content-area video (1080 × content_h) to full 9:16 (1080 × 1920).
 
@@ -243,50 +294,18 @@ def pad_with_banners(
     pad_y = f"{banner_top}+(({VERTICAL_HEIGHT}-{banner_top}-{banner_bottom})-ih)/2"
     filter_str = "pad={}:{}:(ow-iw)/2:{}:black".format(
         VERTICAL_WIDTH, VERTICAL_HEIGHT, pad_y)
-    _run(
-        [
-            "ffmpeg", "-y",
-            "-i", str(video_path),
-            "-vf", filter_str,
-            "-c:a", "copy",
-            str(out),
-        ],
-        desc="pad_with_banners",
-    )
+    gpu = _gpu_args(gpu_opts)
+    cmd = ["ffmpeg", "-y"]
+    if gpu:
+        cmd.extend(gpu)
+    cmd.extend([
+        "-i", str(video_path),
+        "-vf", filter_str,
+        "-c:a", "copy",
+        str(out),
+    ])
+    _run(cmd, desc="pad_with_banners")
     return out
 
 
-def extract_audio(
-    video_path: Union[str, Path],
-    output_path: Union[str, Path],
-) -> Path:
-    _validate_file(video_path, "video_path")
-    out = Path(output_path)
-    _run(
-        [
-            "ffmpeg", "-y",
-            "-i", str(video_path),
-            "-ar", "16000",
-            "-ac", "1",
-            "-f", "wav",
-            str(out),
-        ],
-        desc="extract_audio",
-    )
-    return out
 
-
-def get_video_info(video_path: Union[str, Path]) -> dict:
-    _validate_file(video_path, "video_path")
-    result = _run(
-        [
-            "ffprobe",
-            "-v", "quiet",
-            "-print_format", "json",
-            "-show_format",
-            "-show_streams",
-            str(video_path),
-        ],
-        desc="get_video_info",
-    )
-    return json.loads(result.stdout)

@@ -1,6 +1,16 @@
 """
 MovieShort AI — Shared utilities.
 """
+from pathlib import Path
+
+
+def get_video_basename(video_path: str) -> str:
+    """Extract the base filename without extension using Path.stem.
+    
+    For 'movie.2024.mp4' returns 'movie.2024', for 'movie.mp4' returns 'movie'.
+    Consistent across all modules — fixes hash mismatch for multi-dot filenames.
+    """
+    return Path(video_path).stem
 
 
 def fmt_duration(seconds: float) -> str:

@@ -68,7 +68,7 @@ def _get_model():
                 print(f"  CPU OK (медленнее, но стабильно)")
             except Exception as e2:
                 print(f"  ! CPU тоже не загрузился: {e2}")
-                print(f"  ! Удали папку C:\\Users\\SystemX\\.cache\\huggingface и попробуй снова")
+                print(f"  ! Удали папку {Path.home() / '.cache' / 'huggingface'} и попробуй снова")
                 raise
     else:
         _whisper_model = WhisperModel(
@@ -177,40 +177,6 @@ def _transcribe_audio_file(audio_path, language, progress_callback=None):
 
 
 
-
-
-def transcribe_audio_segment(video_path, start_sec, end_sec, language=None, progress_callback=None):
-    """
-    Extract and transcribe a specific segment of a video.
-    More efficient than transcribe() for clips — avoids re-loading the model.
-    """
-    if language is None:
-        language = config.WHISPER_LANGUAGE
-
-    video_path = str(video_path)
-    temp_audio = str(Path(config.TEMP_DIR) / f"_seg_{os.getpid()}_{int(start_sec)}.wav")
-    os.makedirs(config.TEMP_DIR, exist_ok=True)
-
-    try:
-        subprocess.run(
-            [
-                "ffmpeg", "-y",
-                "-i", video_path,
-                "-ss", str(start_sec),
-                "-to", str(end_sec),
-                "-vn",
-                "-acodec", "pcm_s16le",
-                "-ar", "16000",
-                "-ac", "1",
-                temp_audio,
-            ],
-            capture_output=True, check=True, timeout=300,
-        )
-    except subprocess.CalledProcessError:
-        warnings.warn(f"Could not extract audio segment {start_sec}-{end_sec}")
-        return []
-
-    return _transcribe_audio_file(temp_audio, language, progress_callback)
 
 
 def generate_srt(segments, output_path):
@@ -358,39 +324,6 @@ def filter_segments_in_range(all_segments, start_sec, end_sec):
                     })
             filtered.append(new_seg)
     return filtered
-
-
-def generate_ass(segments, output_path):
-    """Convert segments to .ass subtitle file with styling."""
-    ass_header = """[Script Info]
-ScriptType: v4.00+
-PlayResX: 1080
-PlayResY: 1920
-ScaledBorderAndShadow: yes
-
-[V4+ Styles]
-Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Arial,24,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,3,2,1,2,10,10,10,1
-
-[Events]
-Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
-"""
-    lines = [ass_header]
-    for seg in segments:
-        start = _format_ass_time(seg["start"])
-        end = _format_ass_time(seg["end"])
-        text = seg.get("text", "").strip()
-        if not text:
-            continue
-        # Escape ASS special chars
-        text = text.replace("{", "\\{").replace("}", "\\}")
-        lines.append(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{text}")
-
-    output_path = str(output_path)
-    with open(output_path, "w", encoding="utf-8-sig") as f:
-        f.write("\n".join(lines))
-
-    print(f"ASS saved: {output_path}")
 
 
 def _format_srt_time(seconds):

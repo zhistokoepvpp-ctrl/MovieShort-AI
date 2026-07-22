@@ -2,8 +2,6 @@
 MovieShort AI — Entry point
 Clip movies into YouTube Shorts automatically or manually.
 """
-import sys
-
 # --- Monkey-patch: gradio_client bug (bool schema crashes "const" check) ---
 try:
     import gradio_client.utils as _gcu

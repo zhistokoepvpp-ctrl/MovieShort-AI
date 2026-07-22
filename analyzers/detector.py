@@ -22,8 +22,9 @@ def find_best_clips_standard(video_path, max_duration=60, min_duration=15, num_c
     if not scenes:
         return []
     import random
-    random.shuffle(scenes)
-    selected = scenes[:max(10, num_clips // 2)]
+    scenes_copy = scenes.copy()
+    random.shuffle(scenes_copy)
+    selected = scenes_copy[:num_clips]
     for s in selected:
         s["score"] = random.randint(5, 8)
         s["title"] = ""

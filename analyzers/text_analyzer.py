@@ -7,30 +7,12 @@ from __future__ import annotations
 
 import json
 import os
-import random
 import re
 import time
 
 import httpx
 
 import config
-
-PROMPT_SCENE_ANALYSIS = (
-    "Ты анализируешь сцены из фильмов для YouTube Shorts. "
-    "Вот диалог сцены.\n\n{text}\n\n"
-    "Оцени интересность от 1 до 10 по критериям: "
-    "напряжённость, эмоциональность, наличие крылатых фраз. "
-    "Ответь ТОЛЬКО числом."
-)
-
-PROMPT_SCENE_ANALYSIS_WITH_TITLE = (
-    "Ты анализируешь сцены из фильма «{title}» для YouTube Shorts. "
-    "Вот диалог сцены.\n\n{text}\n\n"
-    "Оцени интересность от 1 до 10: насколько эта сцена известна среди "
-    "зрителей, какие эмоции вызывает, есть ли в ней культовые моменты. "
-    "Учитывай репутацию фильма и отзывы зрителей. "
-    "Ответь ТОЛЬКО числом."
-)
 
 PROMPT_SCENE_SPLIT_OR_KEEP = (
     "Ты анализируешь сцену из фильма «{movie_title}» для YouTube Shorts.\n"
@@ -117,12 +99,13 @@ def _call_gemini_api(prompt_text: str, api_key: str, max_tokens: int = 256) -> s
 # Yandex AI Studio API
 # ---------------------------------------------------------------------------
 
-def _call_yandex_api(prompt_text: str, api_key: str = "", max_tokens: int = 256) -> str:
+def _call_yandex_api(prompt_text: str, api_key: str = "", max_tokens: int = 256, model: str = "") -> str:
     """Call Yandex AI Studio (OpenAI-compatible chat/completions API)."""
     if not api_key:
         api_key = getattr(config, 'YANDEX_API_KEY', '') or os.environ.get('YANDEX_API_KEY', '')
     folder_id = getattr(config, 'YANDEX_FOLDER_ID', '') or os.environ.get('YANDEX_FOLDER_ID', '')
-    model = getattr(config, 'YANDEX_MODEL', 'yandexgpt-lite')
+    if not model:
+        model = getattr(config, 'YANDEX_MODEL', 'yandexgpt-lite')
     base_url = getattr(config, 'YANDEX_BASE_URL', 'https://ai.api.cloud.yandex.net/v1')
 
     print(f"  Yandex model: {model} (folder: ...{folder_id[-6:]})")
@@ -247,192 +230,12 @@ def _parse_split_or_keep(raw: str, scene_duration: float) -> dict:
     return {"decision": "keep"}
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
-def analyze_scenes(
-    transcript_segments: list[dict],
-    api_key: str,
-    model: str | None = None,
-    movie_title: str = "",
-) -> list[dict]:
-    """Score each transcript segment via Gemini.
-
-    Parameters
-    ----------
-    transcript_segments:
-        List of ``{start, end, text}`` dicts.
-    api_key:
-        OpenRouter / Google AI key.
-    model:
-        Unused — kept for backward compat. Reads from ``config.LLM_MODEL``.
-    movie_title:
-        Movie name for context-aware scoring (optional).
-
-    Returns
-    -------
-    List of ``{start, end, text, score}`` dicts.
-    """
-
-    if not api_key:
-        return [
-            {**seg, "score": random.randint(5, 8)}
-            for seg in transcript_segments
-        ]
-
-    total = len(transcript_segments)
-    results: list[dict] = []
-    quota_exhausted = False
-    for i, seg in enumerate(transcript_segments, 1):
-        if quota_exhausted:
-            score = random.randint(5, 8)
-            print(f"  Scene {i}/{total}: score={score} (quota exhausted)")
-            results.append({**seg, "score": score})
-            continue
-
-        if movie_title:
-            prompt = PROMPT_SCENE_ANALYSIS_WITH_TITLE.format(
-                title=movie_title, text=seg["text"]
-            )
-        else:
-            prompt = PROMPT_SCENE_ANALYSIS.format(text=seg["text"])
-        print(f"  Scene {i}/{total}: scoring...", end="")
-        try:
-            raw = _call_gemini_api(prompt, api_key)
-            score = _parse_score(raw)
-            print(f" score={score}")
-        except Exception as e:
-            score = random.randint(5, 8)
-            err_str = str(e)
-            if "QUOTA_EXHAUSTED" in err_str:
-                quota_exhausted = True
-                print(f" score={score} (quota exhausted)")
-            else:
-                print(f" score={score} (fallback)")
-        results.append({**seg, "score": score})
-
-    return results
-
-
-def batch_analyze(
-    segments_batches: list[list[dict]],
-    api_key: str,
-    movie_title: str = "",
-    provider: str = "",
-) -> list[dict]:
-    """Send batches of up to 10 segments in a single API call for efficiency.
-
-    Also generates a short title for each scene (2-4 words, in Russian).
-
-    Parameters
-    ----------
-    segments_batches:
-        Pre-split list of segment lists (caller splits by 10).
-    api_key:
-        API key.
-    movie_title:
-        Movie name for context-aware scoring (optional).
-
-    Returns
-    -------
-    Flat list of ``{start, end, text, score, title}`` dicts.
-    """
-
-    if not api_key:
-        results: list[dict] = []
-        for batch in segments_batches:
-            for seg in batch:
-                results.append({**seg, "score": random.randint(5, 8), "title": ""})
-        return results
-
-    all_results: list[dict] = []
-    total_batches = len(segments_batches)
-    total_scenes = sum(len(b) for b in segments_batches)
-    scored_so_far = 0
-    quota_exhausted = False
-
-    for batch_idx, batch in enumerate(segments_batches):
-        if quota_exhausted:
-            for seg in batch:
-                scored_so_far += 1
-                score = random.randint(5, 8)
-                print(f"  Scene {scored_so_far}/{total_scenes}: score={score} (quota exhausted)")
-                all_results.append({**seg, "score": score, "title": ""})
-            continue
-
-        numbered = "\n".join(
-            f"[{i + 1}] {seg['text']}" for i, seg in enumerate(batch)
-        )
-        if movie_title:
-            prompt = (
-                f"Ты анализируешь сцены из фильма «{movie_title}» для YouTube Shorts.\n"
-                "Вот диалоги сцен (нумерованные).\n\n"
-                f"{numbered}\n\n"
-                "Для каждой сцены укажи:\n"
-                "1) Оценку от 1 до 10 (насколько известна, эмоциональна, есть ли культовые моменты)\n"
-                "2) Короткое название (2-4 слова, по-русски, отражающее суть момента)\n\n"
-                "Формат ответа (строго одна строка на сцену):\n"
-                "[номер] оценка — название\n\n"
-                "Пример:\n"
-                "[1] 7 — Культовая фраза\n"
-                "[2] 4 — Обычный диалог\n"
-                "[3] 9 — Смерть героя"
-            )
-        else:
-            prompt = (
-                "Ты анализируешь сцены из фильмов для YouTube Shorts.\n"
-                "Вот диалоги сцен (нумерованные).\n\n"
-                f"{numbered}\n\n"
-                "Для каждой сцены укажи:\n"
-                "1) Оценку от 1 до 10 (напряжённость, эмоциональность, наличие крылатых фраз)\n"
-                "2) Короткое название (2-4 слова, по-русски)\n\n"
-                "Формат ответа (строго одна строка на сцену):\n"
-                "[номер] оценка — название\n\n"
-                "Пример:\n"
-                "[1] 7 — Напряжённый диалог\n"
-                "[2] 4 — Обычная сцена\n"
-                "[3] 9 — Эпичная битва"
-            )
-
-        print(f"  Batch {batch_idx+1}/{total_batches}: scoring {len(batch)} scenes...", end="")
-        try:
-            raw = call_llm(prompt, api_key, provider)
-            # Parse: [N] score — title
-            scene_data = _parse_batch_response(raw, len(batch))
-            if scene_data:
-                scores_str = ",".join(str(s["score"]) for s in scene_data)
-                print(f" done ({scores_str})")
-            else:
-                # Fallback: try parsing as comma-separated scores (old format)
-                parts = [p.strip() for p in raw.replace(";", ",").split(",")]
-                scores = [_parse_score(p) for p in parts]
-                scene_data = [{"score": scores[i] if i < len(scores) else 5, "title": ""}
-                             for i in range(len(batch))]
-                print(f" done (scores: {','.join(str(s) for s in scores)})")
-        except Exception as e:
-            err_str = str(e)
-            if "QUOTA_EXHAUSTED" in err_str:
-                quota_exhausted = True
-                print(" quota exhausted")
-            else:
-                print(f" fallback: {e!s:.60}")
-            scene_data = [{"score": random.randint(5, 8), "title": ""} for _ in batch]
-
-        for i, seg in enumerate(batch):
-            scored_so_far += 1
-            sd = scene_data[i] if i < len(scene_data) else {"score": 5, "title": ""}
-            all_results.append({**seg, "score": sd["score"], "title": sd["title"]})
-
-    return all_results
-
 
 def _parse_batch_response(raw: str, expected: int) -> list[dict] | None:
     """Parse batch response in format: [N] score — title
 
     Returns list of {score, title} or None if parsing fails.
     """
-    import re
     entries = []
     for line in raw.strip().split("\n"):
         line = line.strip()
@@ -449,156 +252,6 @@ def _parse_batch_response(raw: str, expected: int) -> list[dict] | None:
     entries.sort(key=lambda x: x[0])
     return [{"score": s, "title": t} for _, s, t in entries]
 
-
-# ---------------------------------------------------------------------------
-# Hybrid mode — ask LLM for best scenes
-# ---------------------------------------------------------------------------
-
-PROMPT_HYBRID_BEST_SCENES = (
-    "Ты эксперт по YouTube Shorts из фильмов.\n"
-    "Фильм: «{movie_name}»\n\n"
-    "Назови 7-10 лучших сцен из этого фильма для YouTube Shorts (15-60 сек).\n\n"
-    "Для каждой сцены укажи:\n"
-    "1) МИНУТА: точная минута от начала фильма (только число, например 23 или 71).\n"
-    "   Это ОЧЕНЬ ВАЖНО — укажи максимально точную минуту. Если сцена около 1 часа — пиши 60, если 1 час 10 минут — пиши 70.\n"
-    "2) ОПИСАНИЕ: что происходит, кто участвует, о чём говорят (2-3 предложения)\n"
-    "3) ЦИТАТА: ключевая реплика из сцены (1-2 предложения)\n"
-    "4) НАЗВАНИЕ: короткое название для шортса (2-4 слова, по-русски)\n"
-    "   — название должно быть УНИКАЛЬНЫМ для именно этого фильма\n"
-    "   — если знаешь имя персонажа — упомяни\n"
-    "   — зритель в ленте YouTube должен понять о чём шортс\n"
-    "   Примеры для «{movie_name}»:\n"
-    "     ПЛОХО: «спасение из огня», «общественное мнение», «диалог»\n"
-    "     ХОРОШО: «Хэнкок спасает людей из здания», «Рэйнор спорит с Хэнкоком»\n"
-    "5) ПРИЧИНА: почему эта сцена хороша для шортса\n\n"
-    "Формат (строго одна сцена на блок, блоки через пустую строку):\n\n"
-    "СЦЕНА 1\n"
-    "МИНУТА: 23\n"
-    "ОПИСАНИЕ: [что происходит]\n"
-    "ЦИТАТА: [реплика]\n"
-    "НАЗВАНИЕ: [2-4 слова]\n"
-    "ПРИЧИНА: [почему подходит]\n"
-)
-
-
-def ask_llm_for_best_scenes(movie_name: str, api_key: str = "", provider: str = "") -> list[dict]:
-    """Ask LLM to recommend best scenes from a movie for YouTube Shorts.
-
-    Returns list of dicts: [{scene_num, description, quote, reason}, ...]
-    """
-    prompt = PROMPT_HYBRID_BEST_SCENES.format(movie_name=movie_name)
-    try:
-        raw = call_llm(prompt, api_key, provider, max_tokens=2048)
-        return _parse_hybrid_response(raw)
-    except Exception as e:
-        print(f"  LLM hybrid query failed: {e}")
-        return []
-
-
-def _parse_hybrid_response(raw: str) -> list[dict]:
-    """Parse hybrid mode response into structured scene list.
-    
-    New format:
-        СЦЕНА 1
-        ГДЕ: первая половина
-        ОПИСАНИЕ: текст...
-        ЦИТАТА: «текст»
-        НАЗВАНИЕ: текст
-        ПРИЧИНА: текст
-    """
-    scenes = []
-    blocks = re.split(r'СЦЕНА\s+\d+', raw)
-    nums = re.findall(r'СЦЕНА\s+(\d+)', raw)
-
-    for i, block in enumerate(blocks[1:] if len(blocks) > 1 else []):
-        scene: dict = {"scene_num": int(nums[i]) if i < len(nums) else i + 1}
-
-        # МИНУТА (precise minute from start — primary field in new prompt)
-        minute_match = re.search(r'МИНУТА[:\s]*(\d+)', block)
-
-        # Legacy fallback: ГДЕ (old prompt with "23 минута" or "1 час 10 минут")
-        if not minute_match:
-            where_match = re.search(r'ГДЕ[:\s]*(.+?)(?:\n|ОПИСАНИЕ)', block, re.DOTALL)
-            where_raw = where_match.group(1).strip() if where_match else ""
-            scene["where"] = where_raw
-            # "23 минута" → 23; "1 час 10 минут" → 70
-            hour_match = re.search(r'(\d+)\s*час', where_raw)
-            min_match = re.search(r'(\d+)\s*мин', where_raw)
-            hours = int(hour_match.group(1)) if hour_match else 0
-            mins = int(min_match.group(1)) if min_match else 0
-            scene["minute"] = hours * 60 + mins
-        else:
-            scene["minute"] = int(minute_match.group(1))
-            scene["where"] = ""
-
-        # ОПИСАНИЕ (full scene description)
-        desc_match = re.search(r'ОПИСАНИЕ[:\s]*(.+?)(?:\n|ЦИТАТА)', block, re.DOTALL)
-        scene["description"] = desc_match.group(1).strip() if desc_match else ""
-
-        # ЦИТАТА (key quote)
-        quote_match = re.search(
-            r'ЦИТАТА[:\s]*[«\u00ab"]?(.+?)[»\u00bb"]?\s*(?:\n|НАЗВАНИЕ)',
-            block, re.DOTALL,
-        )
-        scene["quote"] = quote_match.group(1).strip() if quote_match else ""
-
-        # НАЗВАНИЕ (short title)
-        title_match = re.search(r'НАЗВАНИЕ[:\s]*(.+?)(?:\n|ПРИЧИНА)', block, re.DOTALL)
-        scene["title"] = title_match.group(1).strip() if title_match else ""
-
-        # ПРИЧИНА (why good for shorts)
-        reason_match = re.search(r'ПРИЧИНА[:\s]*(.+?)$', block, re.DOTALL)
-        scene["reason"] = reason_match.group(1).strip() if reason_match else ""
-
-        if scene["quote"] or scene["description"]:
-            scenes.append(scene)
-
-    return scenes
-
-
-def rank_scenes(
-    scenes_with_scores: list[dict],
-    top_n: int = 6,
-    score_threshold: float = 7.0,
-) -> list[dict]:
-    """Return best scenes sorted by score, auto-selecting by quality.
-
-    Takes *all* scenes with ``score >= score_threshold``.  If none qualify,
-    falls back to the top 2 scenes.
-
-    Parameters
-    ----------
-    scenes_with_scores:
-        List of ``{start, end, duration, text, score}`` dicts.
-    top_n:
-        **Ignored when score_threshold is used.**  Kept for backward compat.
-    score_threshold:
-        Minimum score (1-10) to consider a scene worth keeping.
-    """
-
-    sorted_scenes = sorted(scenes_with_scores, key=lambda s: s["score"], reverse=True)
-
-    # Auto-select by quality threshold
-    selected: list[dict] = []
-    for scene in sorted_scenes:
-        if scene["score"] >= score_threshold:
-            # Check minimum gap with already-selected scenes
-            too_close = any(
-                abs(scene["start"] - s["start"]) < 5 for s in selected
-            )
-            if not too_close:
-                selected.append(scene)
-
-    # Fallback: if nothing qualifies, take top 2
-    if not selected:
-        for scene in sorted_scenes[:2]:
-            too_close = any(
-                abs(scene["start"] - s["start"]) < 5 for s in selected
-            )
-            if not too_close:
-                selected.append(scene)
-
-    return sorted(selected, key=lambda s: s["start"])
 
 
 def check_api_key(api_key: str, provider: str = "") -> dict:
@@ -663,12 +316,7 @@ def _check_yandex_key(api_key: str) -> dict:
 
     try:
         # Force yandexgpt-lite for the check (independent of user's model selection)
-        original_model = config.YANDEX_MODEL
-        config.YANDEX_MODEL = "yandexgpt-lite"
-        try:
-            _call_yandex_api("Скажи OK", api_key)
-        finally:
-            config.YANDEX_MODEL = original_model
+        _call_yandex_api("Скажи OK", api_key, model="yandexgpt-lite")
         return {"ok": True}
     except Exception as e:
         err = str(e)

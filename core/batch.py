@@ -11,8 +11,9 @@ from pathlib import Path
 import config
 from analyzers.detector import find_best_clips_standard
 from analyzers.text_analyzer import ask_llm_context_mode, call_llm
-from core.pipeline import process_clip
+from core.pipeline import process_clip, process_multiple
 from core.subtitle import load_segments_json
+from utils import get_video_basename
 
 
 def process_movie(video_path, settings=None):
@@ -113,7 +114,7 @@ def process_movie(video_path, settings=None):
     # Find pre-transcribed transcript JSON — match by video+language+model hash
     import hashlib
     transcript_json = None
-    video_basename = Path(video_path).stem.split('.')[0]
+    video_basename = get_video_basename(video_path)
     hash_input = f"{video_path}_{film_language}_{config.WHISPER_MODEL}"
     file_hash = hashlib.md5(hash_input.encode()).hexdigest()[:8]
     expected = str(config.TEMP_DIR / f"full_transcript_{video_basename}_{file_hash}.json")
@@ -129,21 +130,10 @@ def process_movie(video_path, settings=None):
         except Exception:
             pass
 
-    # Step 2: Process each clip
-    results = []
-    base_options = {
-        "subtitles": subtitles,
-        "face_tracking": face_tracking,
-        "max_duration": max_duration,
-        "anti_copyright": settings.get("anti_copyright", config.DEFAULT_ANTI_COPYRIGHT),
-        "blur_background": settings.get("blur_background", config.DEFAULT_BLUR_BACKGROUND),
-        "banner_top": settings.get("banner_top", config.DEFAULT_BANNER_TOP),
-        "banner_bottom": settings.get("banner_bottom", config.DEFAULT_BANNER_BOTTOM),
-    }
-    if transcript_json:
-        base_options["transcript_path"] = transcript_json
-
-    for i, scene in enumerate(best_scenes):
+    # Step 2: Build timestamp list
+    timestamps = []
+    titles = []
+    for scene in best_scenes:
         scene_start = scene["start"]
         scene_end = scene["end"]
         scene_dur = scene_end - scene_start
@@ -162,23 +152,36 @@ def process_movie(video_path, settings=None):
                 print(f"  🎯 Сцена {orig_start_fmt}-{orig_end_fmt} ({scene_dur:.0f}s): "
                       f"центрирован на диалоге → {_format_time(scene_start)}-{_format_time(scene_end)}")
 
-        print(f"\n--- Clip {i+1}/{len(best_scenes)}: "
-              f"{_format_time(scene_start)} - {_format_time(scene_end)} ---")
+        timestamps.append((_format_time(scene_start), _format_time(scene_end)))
+        titles.append(title)
 
-        start = _format_time(scene_start)
-        end = _format_time(scene_end)
+    # Step 3: Process clips in parallel
+    base_options = {
+        "subtitles": subtitles,
+        "face_tracking": face_tracking,
+        "max_duration": max_duration,
+        "anti_copyright": settings.get("anti_copyright", config.DEFAULT_ANTI_COPYRIGHT),
+        "blur_background": settings.get("blur_background", config.DEFAULT_BLUR_BACKGROUND),
+        "banner_top": settings.get("banner_top", config.DEFAULT_BANNER_TOP),
+        "banner_bottom": settings.get("banner_bottom", config.DEFAULT_BANNER_BOTTOM),
+    }
+    if transcript_json:
+        base_options["transcript_path"] = transcript_json
 
-        # Override output naming to put in movie subfolder
-        result = process_clip(video_path, start, end, base_options, title=title)
+    results = process_multiple(video_path, timestamps, base_options, titles=titles, max_workers=2)
 
-        # Move to movie subfolder, preserving LLM title in filename
+    # Move outputs to movie subfolder
+    final_results = []
+    for i, result in enumerate(results):
         if result and os.path.exists(result):
             src_name = Path(result).stem
             new_name = movie_output / f"{src_name}.mp4"
             shutil.move(result, new_name)
-            results.append(str(new_name))
+            final_results.append(str(new_name))
         else:
-            results.append(None)
+            final_results.append(None)
+
+    results = final_results
 
     # Summary
     done = sum(1 for r in results if r is not None)
@@ -337,7 +340,7 @@ def find_best_clips_context(video_path, movie_title, api_key, provider="gemini",
     import hashlib
     clip_segments = None
     from core.subtitle import load_segments_json
-    video_basename = os.path.basename(str(video_path)).split('.')[0]
+    video_basename = get_video_basename(video_path)
     hash_input = f"{video_path}_{language}_{config.WHISPER_MODEL}"
     file_hash = hashlib.md5(hash_input.encode()).hexdigest()[:8]
     transcript_path = str(config.TEMP_DIR / f"full_transcript_{video_basename}_{file_hash}.json")
