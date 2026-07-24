@@ -31,7 +31,7 @@
 
 - **Smart scene detection** — PySceneDetect finds scene boundaries, merges short scenes, splits by dialogue pauses
 - **AI-powered clip selection** — LLM (DeepSeek / Gemini) scores each scene (1-10) with names, uses knowledge about the movie
-- **Face tracking** — OpenCV Haar cascade detects faces, centers the crop on the most active area
+- **Person tracking** — OpenCV detects faces (frontal+profile) and persons (HOG), centers crop on the most active person
 - **Vertical crop (9:16)** — Professional vertical format for YouTube Shorts with blurred background
 - **Word-level subtitles** — faster-whisper transcription with word-level timestamps, customizable font/size/color/position
 - **Batch processing** — Process multiple movies in sequence with full progress tracking
@@ -73,7 +73,7 @@ Opens at `http://localhost:7860`.
 | Option | Default | Description |
 |--------|---------|-------------|
 | Subtitles | On | Speech recognition + subtitle overlay |
-| Smart centering | On | Face detection, centers frame on active area |
+| Smart centering | On | Person detection (faces + HOG), centers frame on active person |
 | Banner areas | On | Top/bottom padding for banners (300px configurable) |
 | Blurred background | On | Fills empty space with blurred video |
 | Anti-copyright | On | Mirror + contrast for Content ID avoidance |
@@ -104,7 +104,7 @@ Opens at `http://localhost:7860`.
 8. **Clip selection** — Score ≥ 7, diversity filter spreads clips across movie, deduplication (min gap 120s), short clip expansion.
 9. **FFmpeg processing** — Cut → 9:16 crop → subtitles → blurred background → 1080×1920
 
-> v1.4.0 cost: ~65 RUB per 102min film (24 LLM calls instead of 474).
+> v1.5.0 cost: ~65 RUB per 102min film (24 LLM calls instead of 474).
 
 ### License
 
@@ -122,7 +122,7 @@ Opens at `http://localhost:7860`.
 
 - **Умный поиск сцен** — PySceneDetect находит границы сцен, объединяет короткие, делит по паузам в диалогах
 - **AI-выбор клипов** — LLM (DeepSeek / Gemini) оценивает каждую сцену (1-10) и даёт название, используя знания о фильме
-- **Face tracking** — OpenCV находит лица, центрирует кадр по самой активной области
+- **Person tracking** — OpenCV находит лица (фронтальные+профильные) и людей (HOG), центрирует кадр по самому активному человеку
 - **Вертикальный кроп (9:16)** — Профессиональный формат YouTube Shorts с размытым фоном
 - **Субтитры по словам** — faster-whisper с таймстемпами на уровне слов; шрифт, размер, цвет, положение настраиваются
 - **Пакетная обработка** — Несколько фильмов подряд с полным отслеживанием прогресса
@@ -195,7 +195,7 @@ run.bat
 8. **Выбор клипов** — Оценка ≥ 7, diversity-фильтр распределяет по фильму, дедупликация (мин. 120с), расширение коротких клипов.
 9. **FFmpeg обработка** — Нарезка → кроп 9:16 → субтитры → размытый фон → 1080×1920
 
-> v1.4.0 стоимость: ~65₽ за фильм 102 мин (24 вызова LLM вместо 474).
+> v1.5.0 стоимость: ~65₽ за фильм 102 мин (24 вызова LLM вместо 474).
 
 ### Структура проекта
 
@@ -205,7 +205,7 @@ MovieShort-AI/
 ├── config.py            # Конфигурация (Whisper, FFmpeg, API, баннеры)
 ├── core/
 │   ├── pipeline.py      # Пайплайн обработки одного клипа
-│   ├── processor.py     # Face tracking + вертикальный кроп
+│   ├── processor.py     # Person tracking (faces + HOG) + вертикальный кроп
 │   ├── batch.py         # Пакетная обработка фильма
 │   └── subtitle.py      # Генерация SRT (word-group, JSON persistence)
 ├── analyzers/
