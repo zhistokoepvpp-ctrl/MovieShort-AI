@@ -1,7 +1,8 @@
-"""Face tracking and vertical video cropping.
+"""Face and person tracking with vertical video cropping.
 
-Uses OpenCV Haar cascade for face detection.
-Cascade XML auto-downloads from GitHub on first use.
+Uses OpenCV Haar cascades (frontal + profile) for face detection,
+and HOG person detector for body detection.
+Cascade XMLs auto-download from GitHub on first use.
 """
 from pathlib import Path
 import time as time_module
@@ -21,27 +22,59 @@ import config
 
 _MODEL_DIR = Path(__file__).parent.parent / "models"
 _FACE_CASCADE = None  # type: cv2.CascadeClassifier | None
+_PROFILE_CASCADE = None  # type: cv2.CascadeClassifier | None
+_HOG = None  # type: cv2.HOGDescriptor | None
+
+
+def _download_cascade(filename: str, url: str) -> Path:
+    """Download a cascade XML if not present locally."""
+    path = _MODEL_DIR / filename
+    if not path.exists():
+        import urllib.request
+        _MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        print(f"[face] Downloading {filename}...")
+        urllib.request.urlretrieve(url, path)
+        print(f"[face] Download complete: {filename}")
+    return path
 
 
 def _get_cascade() -> cv2.CascadeClassifier:
-    """Return (and cache) the face cascade classifier."""
+    """Return (and cache) the frontal face cascade classifier."""
     global _FACE_CASCADE
     if _FACE_CASCADE is None:
-        cascade_path = str(_MODEL_DIR / "haarcascade_frontalface_default.xml")
-        if not Path(cascade_path).exists():
-            import urllib.request
-            _MODEL_DIR.mkdir(parents=True, exist_ok=True)
-            url = (
-                "https://raw.githubusercontent.com/opencv/opencv/master/"
-                "data/haarcascades/haarcascade_frontalface_default.xml"
-            )
-            print("[face] Downloading Haar cascade...")
-            urllib.request.urlretrieve(url, cascade_path)
-            print("[face] Download complete.")
-        _FACE_CASCADE = cv2.CascadeClassifier(cascade_path)
+        path = _download_cascade(
+            "haarcascade_frontalface_default.xml",
+            "https://raw.githubusercontent.com/opencv/opencv/master/"
+            "data/haarcascades/haarcascade_frontalface_default.xml",
+        )
+        _FACE_CASCADE = cv2.CascadeClassifier(str(path))
         if _FACE_CASCADE.empty():
-            raise RuntimeError(f"Failed to load Haar cascade: {cascade_path}")
+            raise RuntimeError(f"Failed to load Haar cascade: {path}")
     return _FACE_CASCADE
+
+
+def _get_profile_cascade() -> cv2.CascadeClassifier:
+    """Return (and cache) the profile face cascade classifier."""
+    global _PROFILE_CASCADE
+    if _PROFILE_CASCADE is None:
+        path = _download_cascade(
+            "haarcascade_profileface.xml",
+            "https://raw.githubusercontent.com/opencv/opencv/master/"
+            "data/haarcascades/haarcascade_profileface.xml",
+        )
+        _PROFILE_CASCADE = cv2.CascadeClassifier(str(path))
+        if _PROFILE_CASCADE.empty():
+            raise RuntimeError(f"Failed to load profile cascade: {path}")
+    return _PROFILE_CASCADE
+
+
+def _get_hog() -> cv2.HOGDescriptor:
+    """Return (and cache) the HOG person detector."""
+    global _HOG
+    if _HOG is None:
+        _HOG = cv2.HOGDescriptor()
+        _HOG.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+    return _HOG
 
 
 # ---------------------------------------------------------------------------
@@ -49,20 +82,67 @@ def _get_cascade() -> cv2.CascadeClassifier:
 # ---------------------------------------------------------------------------
 
 
-def analyze_faces_single_frame(image: np.ndarray) -> list[dict]:
-    """Detect faces in a single cv2 image (BGR).
+def analyze_persons_single_frame(image: np.ndarray) -> list[dict]:
+    """Detect faces (frontal+profile) and persons in a single cv2 image (BGR).
 
-    Returns list of ``{x, y, w, h, confidence}`` dicts in **pixel**
-    coordinates, or an empty list.
+    Returns list of ``{x, y, w, h, confidence, type}`` dicts in **pixel**
+    coordinates.  ``type`` is "face" or "person".
     """
+    detections = []
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    rects = _get_cascade().detectMultiScale(
+
+    # Frontal face
+    frontal_rects = _get_cascade().detectMultiScale(
         gray, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40),
     )
-    return [
-        {"x": x, "y": y, "w": w, "h": h, "confidence": 1.0}
-        for (x, y, w, h) in rects
-    ]
+    for x, y, w, h in frontal_rects:
+        detections.append({"x": x, "y": y, "w": w, "h": h,
+                           "confidence": 1.0, "type": "face"})
+
+    # Profile face (only if no frontal found — avoid double-counting)
+    if not detections:
+        # Left-facing profiles (direct)
+        profile_rects = _get_profile_cascade().detectMultiScale(
+            gray, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40),
+        )
+        for x, y, w, h in profile_rects:
+            detections.append({"x": x, "y": y, "w": w, "h": h,
+                               "confidence": 1.0, "type": "face"})
+
+        # Right-facing profiles (via horizontal flip)
+        flipped = cv2.flip(gray, 1)
+        profile_right = _get_profile_cascade().detectMultiScale(
+            flipped, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40),
+        )
+        for x, y, w, h in profile_right:
+            orig_x = gray.shape[1] - x - w
+            detections.append({"x": orig_x, "y": y, "w": w, "h": h,
+                               "confidence": 1.0, "type": "face"})
+
+    # HOG person detector (only if no faces found — trigger on face-less runs)
+    if not detections:
+        hog = _get_hog()
+        h, w = image.shape[:2]
+        # HOG works best at 640px width
+        scale = 640 / w if w > 640 else 1.0
+        if scale < 1.0:
+            small = cv2.resize(image, None, fx=scale, fy=scale,
+                               interpolation=cv2.INTER_LINEAR)
+        else:
+            small = image
+        rects, weights = hog.detectMultiScale(small, winStride=(8, 8),
+                                               padding=(4, 4), scale=1.05)
+        for (x, y, w, h), weight in zip(rects, weights):
+            # Scale back to original coordinates
+            ox, oy, ow, oh = int(x / scale), int(y / scale), int(w / scale), int(h / scale)
+            detections.append({"x": ox, "y": oy, "w": ow, "h": oh,
+                               "confidence": float(weight), "type": "person"})
+
+    return detections
+
+
+# Backward compat alias
+analyze_faces_single_frame = analyze_persons_single_frame
 
 
 # ---------------------------------------------------------------------------
@@ -72,40 +152,46 @@ def analyze_faces_single_frame(image: np.ndarray) -> list[dict]:
 import hashlib
 
 
-def _get_face_cache_path(video_path: str) -> Path:
-    """Return path to face cache JSON for the given video."""
+def _get_person_cache_path(video_path: str) -> Path:
+    """Return path to person cache JSON for the given video."""
     h = hashlib.md5(video_path.encode()).hexdigest()[:8]
-    return Path(config.TEMP_DIR) / f"_face_cache_{h}.json"
+    return Path(config.TEMP_DIR) / f"_person_cache_{h}.json"
 
 
-def _load_face_cache(video_path: str):
-    """Load cached face data if it exists and is newer than video."""
-    cache_path = _get_face_cache_path(video_path)
+def _load_person_cache(video_path: str):
+    """Load cached person data if it exists and is newer than video."""
+    cache_path = _get_person_cache_path(video_path)
     if not cache_path.exists():
         return None
     try:
         cache_mtime = cache_path.stat().st_mtime
         video_mtime = Path(video_path).stat().st_mtime
         if video_mtime > cache_mtime:
-            print("  Face cache stale (video updated) — re-scanning")
+            print("  Person cache stale (video updated) — re-scanning")
             return None
         with open(cache_path, "r") as f:
             data = json.load(f)
-        print(f"  Using cached face data ({len(data)} frames)")
+        print(f"  Using cached person data ({len(data)} frames)")
         return data
     except Exception:
         return None
 
 
-def _save_face_cache(video_path: str, face_data: list[dict]) -> None:
-    """Save face data to cache JSON."""
-    cache_path = _get_face_cache_path(video_path)
+def _save_person_cache(video_path: str, person_data: list[dict]) -> None:
+    """Save person data to cache JSON."""
+    cache_path = _get_person_cache_path(video_path)
     try:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         with open(cache_path, "w") as f:
-            json.dump(face_data, f, ensure_ascii=False, indent=2)
+            json.dump(person_data, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
+
+
+# Backward compat aliases
+_get_face_cache_path = _get_person_cache_path
+_load_face_cache = _load_person_cache
+_save_face_cache = _save_person_cache
 
 
 # ---------------------------------------------------------------------------
@@ -113,14 +199,17 @@ def _save_face_cache(video_path: str, face_data: list[dict]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def analyze_faces(video_path: str, progress_callback=None) -> list[dict]:
-    """Scan video for faces every ``FACE_TRACKING_INTERVAL`` frames.
+def analyze_persons(video_path: str, progress_callback=None) -> list[dict]:
+    """Scan video for faces (frontal+profile) and persons every ~1 second.
 
-    Downsamples frames before detection for 5-10x speedup.
-    Prints frame-by-frame progress.
+    Reads frames SEQUENTIALLY (no frame-index seeking — unreliable on some
+    codecs/containers).  Samples 1 frame per second for detection.
 
-    Returns list of ``{frame_idx, x, y, w, h, num_faces}`` dicts.
-    Entries with no faces contain ``None`` for coordinates.
+    Uses frontal face cascade, profile face cascade (if no frontal found),
+    and HOG person detector (triggered after 5 consecutive face-less frames,
+    then runs continuously until face reappears).
+
+    Returns list of ``{frame_idx, x, y, w, h, num_faces, num_persons, type}`` dicts.
     """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -128,32 +217,41 @@ def analyze_faces(video_path: str, progress_callback=None) -> list[dict]:
 
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
-    interval = config.FACE_TRACKING_INTERVAL
+    # Sample 1 frame per second (sequential reading — no frame seeking)
+    interval = max(1, int(fps))
 
     if total <= 0:
-        print(f"  ⚠ OpenCV не может декодировать видео (total_frames={total}) — "
-              "пропускаем face tracking")
+        print(f"  ⚠ OpenCV cannot decode video (total_frames={total}) — "
+              "skipping person tracking")
         cap.release()
         return []
 
-    analyzed_count = total // interval
-
+    analyzed_count = max(1, total // interval) if interval > 0 else 1
     cascade = _get_cascade()
-    face_data: list[dict] = []
+    profile_cascade = _get_profile_cascade()
+    hog = _get_hog()
+
+    person_data: list[dict] = []
     last_print = 0
     _start = time_module.time()
+
+    consecutive_no_face = 0
+    HOG_TRIGGER_FRAMES = 0  # trigger HOG immediately on any face-less frame
+    hog_active = False
 
     # Downscale target: max 360px on the longest side
     _MAX_DETECT_PX = 360
 
-    # Jump directly to every Nth frame instead of reading all frames sequentially.
-    # Sequential cap.read() decodes every single frame (~15ms each), which alone
-    # takes 30s+ for a 90s clip.  Seeking by frame-index skips decode entirely.
-    for frame_idx in range(0, total, interval):
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+    frame_idx = 0
+    while True:
         ret, frame = cap.read()
         if not ret:
             break
+
+        # Sample every `interval`-th frame (= once per second)
+        if frame_idx % interval != 0:
+            frame_idx += 1
+            continue
 
         h, w = frame.shape[:2]
         # Downscale for detection speed
@@ -165,47 +263,134 @@ def analyze_faces(video_path: str, progress_callback=None) -> list[dict]:
             small = frame
 
         gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-        rects = cascade.detectMultiScale(
+        detections = []
+        num_faces = 0
+        num_persons = 0
+
+        # 1. Frontal face
+        frontal_rects = cascade.detectMultiScale(
             gray, scaleFactor=1.15, minNeighbors=4, minSize=(30, 30),
         )
-
-        if len(rects) > 0:
-            # Scale bbox back to original coordinates
-            best = max(rects, key=lambda r: r[2] * r[3])
+        if len(frontal_rects) > 0:
+            best = max(frontal_rects, key=lambda r: r[2] * r[3])
             x, y, bw, bh = (int(v / scale) for v in best)
-            face_data.append({
+            detections.append({"x": float(x), "y": float(y),
+                               "w": float(bw), "h": float(bh),
+                               "confidence": 1.0, "type": "face"})
+            num_faces = len(frontal_rects)
+            consecutive_no_face = 0
+            hog_active = False
+        else:
+            # 2. Profile face (only if no frontal) — detect BOTH sides
+            # Left-facing profiles (direct)
+            profile_rects = profile_cascade.detectMultiScale(
+                gray, scaleFactor=1.15, minNeighbors=4, minSize=(30, 30),
+            )
+            profile_results = list(profile_rects)
+
+            # Right-facing profiles (via horizontal flip)
+            flipped = cv2.flip(gray, 1)
+            profile_right = profile_cascade.detectMultiScale(
+                flipped, scaleFactor=1.15, minNeighbors=4, minSize=(30, 30),
+            )
+            for x, y, w, h in profile_right:
+                # Convert flipped coords back to original: x_orig = width - x - w
+                orig_x = gray.shape[1] - x - w
+                profile_results.append((orig_x, y, w, h))
+
+            if len(profile_results) > 0:
+                best = max(profile_results, key=lambda r: r[2] * r[3])
+                x, y, bw, bh = (int(v / scale) for v in best)
+                detections.append({"x": float(x), "y": float(y),
+                                   "w": float(bw), "h": float(bh),
+                                   "confidence": 1.0, "type": "face"})
+                num_faces = len(profile_results)
+                consecutive_no_face = 0
+                hog_active = False
+            else:
+                consecutive_no_face += 1
+
+            # 3. HOG person detector (trigger after run-length threshold,
+            #    then stays active until face reappears)
+            if consecutive_no_face >= HOG_TRIGGER_FRAMES or hog_active:
+                hog_active = True
+                rects, weights = hog.detectMultiScale(
+                    small, winStride=(4, 4), padding=(4, 4), scale=1.03)
+                if len(rects) > 0:
+                    best_idx = np.argmax(weights)
+                    x, y, bw, bh = rects[best_idx]
+                    ox = int(x / scale)
+                    oy = int(y / scale)
+                    ow = int(bw / scale)
+                    oh = int(bh / scale)
+                    detections.append({"x": float(ox), "y": float(oy),
+                                       "w": float(ow), "h": float(oh),
+                                       "confidence": float(weights[best_idx]),
+                                       "type": "person"})
+                    num_persons = len(rects)
+
+        if detections:
+            best_det = max(detections, key=lambda d: d["w"] * d["h"])
+
+            # Compute body-centered crop position
+            if best_det["type"] == "face":
+                # Face center horizontally, body center estimate below face
+                cx = best_det["x"] + best_det["w"] / 2
+                cy = best_det["y"] + best_det["h"] * 2  # heuristic: body below face
+            else:
+                # Person center (HOG returns full body)
+                cx = best_det["x"] + best_det["w"] / 2
+                cy = best_det["y"] + best_det["h"] / 2
+
+            person_data.append({
                 "frame_idx": frame_idx,
-                "x": float(x),
-                "y": float(y),
-                "w": float(bw),
-                "h": float(bh),
-                "num_faces": len(rects),
+                "x": best_det["x"],
+                "y": best_det["y"],
+                "w": best_det["w"],
+                "h": best_det["h"],
+                "center_x": cx,
+                "center_y": cy,
+                "num_faces": num_faces,
+                "num_persons": num_persons,
+                "type": best_det["type"],
             })
         else:
-            face_data.append({
+            person_data.append({
                 "frame_idx": frame_idx,
                 "x": None, "y": None,
                 "w": None, "h": None,
+                "center_x": None, "center_y": None,
                 "num_faces": 0,
+                "num_persons": 0,
+                "type": None,
             })
 
         # User-visible progress
-        done = len(face_data)
+        done = len(person_data)
         pct = done / max(analyzed_count, 1)
         elapsed = time_module.time() - _start
         if done % 10 == 0 or pct - last_print >= 0.05:
             eta = (elapsed / max(pct, 0.01) - elapsed) if pct > 0 else 0
-            print(f"  Face scan: {pct:.0%}  ({done}/{analyzed_count} frames, {elapsed:.0f}s elapsed, ETA {eta:.0f}s)")
+            print(f"  Person scan: {pct:.0%}  ({done}/{analyzed_count} frames, "
+                  f"{elapsed:.0f}s elapsed, ETA {eta:.0f}s)")
             last_print = pct
 
         if progress_callback:
             progress_callback(frame_idx / max(total, 1))
 
+        frame_idx += 1
+
     cap.release()
     _elapsed = time_module.time() - _start
-    print(f"  Face scan complete in {_elapsed:.0f}s, found {sum(1 for f in face_data if f['x'] is not None)}/{len(face_data)} frames with faces")
-    _save_face_cache(video_path, face_data)
-    return face_data
+    found = sum(1 for f in person_data if f["x"] is not None)
+    print(f"  Person scan complete in {_elapsed:.0f}s, "
+          f"found {found}/{len(person_data)} frames with faces/persons")
+    _save_person_cache(video_path, person_data)
+    return person_data
+
+
+# Backward compat alias
+analyze_faces = analyze_persons
 
 
 # ---------------------------------------------------------------------------
@@ -213,14 +398,15 @@ def analyze_faces(video_path: str, progress_callback=None) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
-def compute_crop_path(
-    face_data: list[dict],
+def compute_person_crop_path(
+    person_data: list[dict],
     video_width: int,
     video_height: int,
 ) -> list[dict]:
     """Compute smoothed 9:16 crop rectangles for each analyzed frame.
 
-    Uses a moving-average window of 3 for smoothing.
+    Uses person-centered variance metric (max(x_std, y_std)) for spread,
+    moving-average window of 3 for smoothing.
     Returns list of ``{frame_idx, crop_x, crop_y, crop_w, crop_h}``.
     """
     target_ratio = 9 / 16
@@ -230,11 +416,11 @@ def compute_crop_path(
         target_h = video_height
         target_w = int(target_h * target_ratio)
 
-    frames_with_faces = [
-        (i, fd) for i, fd in enumerate(face_data) if fd["x"] is not None
+    frames_with_persons = [
+        (i, fd) for i, fd in enumerate(person_data) if fd["x"] is not None
     ]
 
-    if not frames_with_faces:
+    if not frames_with_persons:
         cx = video_width / 2
         cy = video_height / 2
         return [
@@ -245,20 +431,21 @@ def compute_crop_path(
                 "crop_w": min(target_w, video_width),
                 "crop_h": min(target_h, video_height),
             }
-            for fd in face_data
+            for fd in person_data
         ]
 
-    # Raw centers per frame index
+    # Raw centers per frame index — use stored body-centered coordinates
     raw_centers: dict[int, tuple[float, float]] = {}
-    for idx, fd in frames_with_faces:
-        raw_centers[idx] = (fd["x"] + fd["w"] / 2, fd["y"] + fd["h"] / 2)
+    for idx, fd in frames_with_persons:
+        raw_centers[idx] = (fd["center_x"], fd["center_y"])
 
-    all_indices = [fd["frame_idx"] for fd in face_data]
+    all_indices = [fd["frame_idx"] for fd in person_data]
     smoothed: dict[int, tuple[float, float]] = {}
     window = 3
 
     for fi in all_indices:
         if fi in raw_centers:
+            # Smooth with neighbouring detections (window=3)
             neighbors = [
                 raw_centers[j] for j in raw_centers if abs(j - fi) <= window
             ]
@@ -267,20 +454,20 @@ def compute_crop_path(
         else:
             before = [(j, raw_centers[j]) for j in raw_centers if j < fi]
             after = [(j, raw_centers[j]) for j in raw_centers if j > fi]
-            if before and after:
-                b = max(before, key=lambda t: t[0])
-                a = min(after, key=lambda t: t[0])
-                t = (fi - b[0]) / max(a[0] - b[0], 1)
-                avg_x = b[1][0] * (1 - t) + a[1][0] * t
-                avg_y = b[1][1] * (1 - t) + a[1][1] * t
-            elif before:
+            if before:
+                # Stay at last-known position — don't pull toward future
                 avg_x, avg_y = max(before, key=lambda t: t[0])[1]
-            else:
+            elif after:
+                # No past detection yet — use first future position
                 avg_x, avg_y = min(after, key=lambda t: t[0])[1]
+            else:
+                # No detection at all — center frame (shouldn't happen)
+                avg_x = video_width / 2
+                avg_y = video_height / 2
         smoothed[fi] = (avg_x, avg_y)
 
     result = []
-    for fd in face_data:
+    for fd in person_data:
         fi = fd["frame_idx"]
         cx, cy = smoothed.get(fi, (video_width / 2, video_height / 2))
         crop_x = int(cx - target_w / 2)
@@ -295,6 +482,10 @@ def compute_crop_path(
             "crop_h": target_h,
         })
     return result
+
+
+# Backward compat alias
+compute_crop_path = compute_person_crop_path
 
 
 # ---------------------------------------------------------------------------
@@ -381,7 +572,7 @@ def _face_tracking_crop(video_path, output_path, crop_path, fps,
                          clip_duration=0):
     """Apply face-tracking crop using a single stable crop rectangle.
 
-    Computes the median crop position (smoothed by compute_crop_path),
+    Computes the median crop position (smoothed by compute_person_crop_path),
     scales coordinates to match the FFmpeg scale filter, and runs one
     FFmpeg command (no segment splitting — avoids ultra-short segment
     crashes and concat complexity).
@@ -400,9 +591,26 @@ def _face_tracking_crop(video_path, output_path, crop_path, fps,
     video_w = _get_video_width(video_path)
     video_h = _get_video_height(video_path)
 
-    # Median crop position in original video coordinates
+    # Check variance — if high, use segment-based dynamic cropping
     crop_x_list = [entry["crop_x"] for entry in crop_path]
     crop_y_list = [entry["crop_y"] for entry in crop_path]
+    x_std = float(np.std(crop_x_list)) if len(crop_x_list) > 1 else 0
+    y_std = float(np.std(crop_y_list)) if len(crop_y_list) > 1 else 0
+    max_std = max(x_std, y_std)
+
+    # Dynamic crop threshold: 50px std deviation triggers segment-based approach
+    DYNAMIC_CROP_THRESHOLD = 50.0
+
+    if max_std > DYNAMIC_CROP_THRESHOLD:
+        print(f"  High movement variance (std={max_std:.0f}px) — using segment-based dynamic crop")
+        _segment_based_crop(video_path, output_path, crop_path, fps,
+                           anti_copyright=anti_copyright, ac_part=ac_part,
+                           target_w=target_w, content_h=content_h,
+                           progress_callback=progress_callback,
+                           clip_duration=clip_duration)
+        return
+
+    # Median crop position in original video coordinates
     crop_x_orig = int(np.median(crop_x_list))
     crop_y_orig = int(np.median(crop_y_list))
 
@@ -456,6 +664,142 @@ def _face_tracking_crop(video_path, output_path, crop_path, fps,
     _proc.wait()
     if _proc.returncode != 0:
         raise subprocess.CalledProcessError(_proc.returncode, _proc.args)
+
+
+def _segment_based_crop(video_path, output_path, crop_path, fps,
+                        anti_copyright=True, ac_part="", target_w=1080,
+                        content_h=1320, progress_callback=None,
+                        clip_duration=0):
+    """Apply segment-based dynamic cropping for high-variance movement.
+
+    Splits the clip into ~10s segments, each with its own crop position.
+    Uses concat filter (not demuxer) to avoid AAC encoder delay issues.
+    Input seeking (-ss before -i) for segment extraction.
+    """
+    import re as _re
+    import tempfile
+
+    video_w = _get_video_width(video_path)
+    video_h = _get_video_height(video_path)
+
+    # Segment duration in seconds
+    SEGMENT_DURATION = 10.0
+    total_frames = len(crop_path)
+    frames_per_segment = int(SEGMENT_DURATION * fps)
+
+    # Build segments
+    segments = []
+    seg_start = 0
+    while seg_start < total_frames:
+        seg_end = min(seg_start + frames_per_segment, total_frames)
+        seg_frames = crop_path[seg_start:seg_end]
+
+        # Median crop for this segment
+        crop_x = int(np.median([e["crop_x"] for e in seg_frames]))
+        crop_y = int(np.median([e["crop_y"] for e in seg_frames]))
+
+        # Time bounds for this segment
+        start_time_sec = seg_frames[0]["frame_idx"] / fps
+        end_time_sec = seg_frames[-1]["frame_idx"] / fps + (1.0 / fps)
+
+        segments.append({
+            "start_sec": start_time_sec,
+            "end_sec": end_time_sec,
+            "crop_x": crop_x,
+            "crop_y": crop_y,
+        })
+        seg_start = seg_end
+
+    if not segments:
+        _center_crop_ffmpeg_fixed(video_path, output_path, target_w, content_h,
+                                   ac_part, progress_callback, clip_duration)
+        return
+
+    # Scale factor
+    if video_w > 0 and video_h > 0:
+        sf = max(target_w / video_w, content_h / video_h)
+    else:
+        sf = 1.0
+
+    # Generate segment files
+    tmp_dir = Path(tempfile.mkdtemp(prefix="ms_crop_"))
+    segment_files = []
+    concat_list_path = tmp_dir / "concat.txt"
+
+    try:
+        for i, seg in enumerate(segments):
+            seg_file = tmp_dir / f"seg_{i:03d}.mp4"
+            segment_files.append(seg_file)
+
+            # Scale coordinates
+            offset_x = max(0, min(int(seg["crop_x"] * sf), int(video_w * sf - target_w)))
+            offset_y = max(0, min(int(seg["crop_y"] * sf), int(video_h * sf - content_h)))
+
+            filter_str = (
+                f"scale={target_w}:{content_h}:force_original_aspect_ratio=increase,"
+                f"crop={target_w}:{content_h}:{offset_x}:{offset_y}"
+                f"{ac_part}"
+            )
+
+            # Input seeking for each segment
+            start_h = int(seg["start_sec"] // 3600)
+            start_m = int((seg["start_sec"] % 3600) // 60)
+            start_s = seg["start_sec"] % 60
+            end_h = int(seg["end_sec"] // 3600)
+            end_m = int((seg["end_sec"] % 3600) // 60)
+            end_s = seg["end_sec"] % 60
+
+            cmd = [
+                "ffmpeg", "-y",
+                "-ss", f"{start_h:02d}:{start_m:02d}:{start_s:06.3f}",
+                "-to", f"{end_h:02d}:{end_m:02d}:{end_s:06.3f}",
+                "-i", video_path,
+                "-vf", filter_str,
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                "-c:a", "aac",
+                str(seg_file),
+            ]
+            _run(cmd, desc=f"segment_{i}")
+
+        # Write concat list
+        with open(concat_list_path, "w") as f:
+            for seg_file in segment_files:
+                f.write(f"file '{seg_file}'\n")
+
+        # Concat using filter (not demuxer — avoids AAC encoder delay)
+        _time_re = _re.compile(r"time=(\d+):(\d+):(\d+\.\d+)")
+        _proc = subprocess.Popen(
+            [
+                "ffmpeg", "-y",
+                "-f", "concat", "-safe", "0",
+                "-i", str(concat_list_path),
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                "-c:a", "aac",
+                output_path,
+            ],
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+        )
+        assert _proc.stderr is not None
+        for line in _proc.stderr:
+            m = _time_re.search(line)
+            if m and clip_duration > 0:
+                h, mnt, s = int(m.group(1)), int(m.group(2)), float(m.group(3))
+                elapsed = h * 3600 + mnt * 60 + s
+                pct = min(0.99, 0.6 + 0.39 * (elapsed / clip_duration))
+                if progress_callback:
+                    progress_callback(pct)
+        _proc.wait()
+        if _proc.returncode != 0:
+            raise subprocess.CalledProcessError(_proc.returncode, _proc.args)
+
+    finally:
+        # Cleanup temp files
+        import shutil
+        try:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
 
 
 def _get_clip_duration(video_path: str) -> float:
@@ -523,9 +867,10 @@ def apply_vertical_crop(
 ) -> dict:
     """Scale-to-fill the content area (no banner padding, center crop).
 
-    Runs face analysis for stats/logging only — the source is scaled to fill
-    the banner-padded content area (1080 × content_h), cropping overflow.
-    Banner padding is added in a separate step after subtitle embedding.
+    Runs person analysis (faces + HOG) for stats/logging — the source is
+    scaled to fill the banner-padded content area (1080 × content_h),
+    cropping overflow. Banner padding is added in a separate step after
+    subtitle embedding.
 
     Returns metadata dict with ``output_size``, ``faces_found``.
     """
@@ -539,16 +884,16 @@ def apply_vertical_crop(
     if progress_callback:
         progress_callback(0.05)
 
-    # Face analysis with timeout (30s max) — try cache first
-    face_data = _load_face_cache(video_path)
-    if face_data is None:
+    # Person analysis with timeout (30s max) — try cache first
+    person_data = _load_person_cache(video_path)
+    if person_data is None:
         from concurrent.futures import ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=1) as pool:
-            fut = pool.submit(analyze_faces, video_path)
+            fut = pool.submit(analyze_persons, video_path)
             try:
-                face_data = fut.result(timeout=30)
+                person_data = fut.result(timeout=30)
             except _CFTimeoutError:
-                print("  ⚠ Face scan timed out (30s) — using fallback")
+                print("  ⚠ Person scan timed out (30s) — using fallback")
                 return _center_crop_ffmpeg(video_path, output_path, progress_callback,
                                            anti_copyright=anti_copyright,
                                            banner_top=banner_top, banner_bottom=banner_bottom)
@@ -573,17 +918,20 @@ def apply_vertical_crop(
             )
     ac_part = "," + ",".join(ac_filters) if ac_filters else ""
 
-    # Log face analysis results
-    valid = [fd for fd in face_data if fd["x"] is not None]
+    # Log person analysis results
+    valid = [fd for fd in person_data if fd["x"] is not None]
     faces_found = len(valid)
-    total_frames = len(face_data)
+    total_frames = len(person_data)
     if faces_found > 0:
         avg_cx = float(np.mean([fd["x"] + fd["w"] / 2 for fd in valid]))
         avg_cy = float(np.mean([fd["y"] + fd["h"] / 2 for fd in valid]))
-        print(f"  Faces found in {faces_found}/{total_frames} frames "
-              f"(avg center: {avg_cx:.0f}, {avg_cy:.0f})")
+        types = [fd.get("type", "face") for fd in valid]
+        face_count = types.count("face")
+        person_count = types.count("person")
+        print(f"  Detected {faces_found}/{total_frames} frames "
+              f"({face_count} face, {person_count} person, avg center: {avg_cx:.0f}, {avg_cy:.0f})")
     else:
-        print(f"  No faces detected in {total_frames} frames")
+        print(f"  No faces/persons detected in {total_frames} frames")
 
     if progress_callback:
         progress_callback(0.6)
@@ -591,13 +939,13 @@ def apply_vertical_crop(
     clip_duration = _get_clip_duration(video_path)
     fps = _get_video_fps(video_path)
 
-    # Decide: face-tracking crop or center crop
+    # Decide: person-tracking crop or center crop
     if faces_found > 0 and fps > 0:
-        print(f"  Applying face-tracking crop ({faces_found} face frames)...")
+        print(f"  Applying person-tracking crop ({faces_found} frames)...")
         video_width = _get_video_width(video_path)
         video_height = _get_video_height(video_path)
         if video_width > 0 and video_height > 0:
-            crop_path = compute_crop_path(face_data, video_width, video_height)
+            crop_path = compute_person_crop_path(person_data, video_width, video_height)
             _face_tracking_crop(video_path, output_path, crop_path, fps,
                                 anti_copyright=anti_copyright,
                                 ac_part=ac_part, target_w=target_w,
@@ -608,7 +956,7 @@ def apply_vertical_crop(
             _center_crop_ffmpeg_fixed(video_path, output_path, target_w, content_h,
                                       ac_part, progress_callback, clip_duration)
     else:
-        print(f"  Using center crop (no face data)")
+        print(f"  Using center crop (no person data)")
         _center_crop_ffmpeg_fixed(video_path, output_path, target_w, content_h,
                                   ac_part, progress_callback, clip_duration)
 
