@@ -112,17 +112,37 @@ def clip_video(
     output_path: Union[str, Path],
     gpu_opts=None,
 ) -> Path:
+    """Cut a video clip from start_time to end_time.
+
+    Uses input seeking (-ss before -i) with **software decode** for fast
+    and frame-accurate seeking across all container/codec combinations.
+    Duration is specified via -t (not -to) for deterministic behavior.
+    GPU hardware decoding is NOT used — software decode ensures correct
+    timestamp handling. GPU encoding (nvenc) IS used when available.
+    """
     _validate_file(input_path, "input_path")
     _validate_time(start_time, "start_time")
     _validate_time(end_time, "end_time")
     out = Path(output_path)
-    gpu = _gpu_args(gpu_opts)
-    cmd = ["ffmpeg", "-y"]
-    if gpu:
-        # GPU: -hwaccel before -i, input seeking (-ss before -i), nvenc encoder
-        cmd.extend(gpu)
-    cmd.extend(["-ss", start_time, "-to", end_time, "-i", str(input_path)])
-    if gpu:
+
+    # Compute duration as -t (more deterministic than -to after -i)
+    def _to_sec(t: str) -> float:
+        parts = t.split(":")
+        return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+
+    duration = _to_sec(end_time) - _to_sec(start_time)
+    if duration <= 0:
+        raise ValueError(
+            f"end_time ({end_time}) must be after start_time ({start_time})"
+        )
+
+    # Input seeking (fast, keyframe-based) with software decode
+    # NO -hwaccel cuda — software decode is reliable across all containers
+    cmd = ["ffmpeg", "-y",
+           "-ss", start_time, "-i", str(input_path),
+           "-t", f"{duration:.3f}"]
+    if gpu_opts:
+        # GPU encoding only (nvenc) — decode is software
         cmd.extend(["-c:v", gpu_opts["encoder"], "-preset", "p1", "-cq", "23"])
     else:
         cmd.extend(["-c:v", "libx264", "-preset", "veryfast", "-crf", "23"])
