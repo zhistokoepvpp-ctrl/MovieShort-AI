@@ -52,6 +52,21 @@ run.bat
 
 Opens at `http://localhost:7860`.
 
+### Screenshots
+
+| Main Interface | Clip Results |
+|:---:|:---:|
+| ![GUI Main](screenshots/1.jpg) | ![Clip output](screenshots/2.jpg) |
+
+### Support
+
+If you find this project useful, you can support it:
+
+- ⭐ **Star on GitHub** — helps others discover the project
+- 💰 **Donate**: [Boosty](https://boosty.to/nzeronfourme/donate) | [DonateX](https://donatex.gg/donate/nzeronfourme)
+- 🐛 **Report bugs** — create an [Issue](https://github.com/zhistokoepvpp-ctrl/MovieShort-AI/issues)
+- 🔧 **Contribute** — PRs welcome!
+
 #### Prerequisites
 
 - **Python 3.9+** (if missing, `setup.bat` shows a download link to python.org)
@@ -142,6 +157,21 @@ run.bat
 ```
 
 Откроется `http://localhost:7860`.
+
+### Скриншоты
+
+| Главный интерфейс | Результаты клипов |
+|:---:|:---:|
+| ![GUI Main](screenshots/1.jpg) | ![Clip output](screenshots/2.jpg) |
+
+### Поддержка
+
+Если проект оказался полезным, поддержать можно так:
+
+- ⭐ **Звёздочка на GitHub** — помогает другим найти проект
+- 💰 **Донат**: [Boosty](https://boosty.to/nzeronfourme/donate) | [DonateX](https://donatex.gg/donate/nzeronfourme)
+- 🐛 **Сообщить о баге** — создать [Issue](https://github.com/zhistokoepvpp-ctrl/MovieShort-AI/issues)
+- 🔧 **Внести вклад** — PR приветствуются!
 
 #### Зависимости
 
