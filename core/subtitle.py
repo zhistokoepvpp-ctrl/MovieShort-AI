@@ -209,15 +209,13 @@ def generate_srt(segments, output_path):
     print(f"SRT saved: {output_path}")
 
 
-def generate_word_group_srt(segments, output_path, max_chars=150):
-    """Generate SRT with word-groups (2-4 words per line, max 1 line).
+def _iter_word_groups(segments, max_chars=150):
+    """Yield (start, end, text) word-groups — shared by SRT and ASS writers.
 
-    Uses word-level timestamps from Whisper for precise sync.
-    Falls back to segment-level if no word timestamps available.
+    Grouping logic is identical to the original generate_word_group_srt:
+    words grouped up to max_chars; segments without word timestamps fall
+    back to splitting segment text into max_chars chunks.
     """
-    lines = []
-    idx = 0
-
     for seg in segments:
         words = seg.get("words", [])
         if not words:
@@ -225,15 +223,10 @@ def generate_word_group_srt(segments, output_path, max_chars=150):
             text = seg.get("text", "").strip()
             if not text:
                 continue
-            # Split into chunks of max_chars
             while text:
                 chunk = text[:max_chars]
                 text = text[max_chars:]
-                idx += 1
-                lines.append(f"{idx}")
-                lines.append(f"{_format_srt_time(seg['start'])} --> {_format_srt_time(seg['end'])}")
-                lines.append(chunk)
-                lines.append("")
+                yield seg["start"], seg["end"], chunk
             continue
 
         # Group words by max_chars
@@ -258,10 +251,7 @@ def generate_word_group_srt(segments, output_path, max_chars=150):
         if current_group:
             groups.append(current_group)
 
-        # Generate SRT entries for each group
         for group in groups:
-            if not group:
-                continue
             group_start = group[0].get("start", seg["start"])
             group_end = group[-1].get("end", seg["end"])
             group_text = " ".join(
@@ -269,11 +259,24 @@ def generate_word_group_srt(segments, output_path, max_chars=150):
             )
             if not group_text:
                 continue
-            idx += 1
-            lines.append(f"{idx}")
-            lines.append(f"{_format_srt_time(group_start)} --> {_format_srt_time(group_end)}")
-            lines.append(group_text)
-            lines.append("")
+            yield group_start, group_end, group_text
+
+
+def generate_word_group_srt(segments, output_path, max_chars=150):
+    """Generate SRT with word-groups (2-4 words per line, max 1 line).
+
+    Uses word-level timestamps from Whisper for precise sync.
+    Falls back to segment-level if no word timestamps available.
+    """
+    lines = []
+    idx = 0
+
+    for group_start, group_end, group_text in _iter_word_groups(segments, max_chars):
+        idx += 1
+        lines.append(f"{idx}")
+        lines.append(f"{_format_srt_time(group_start)} --> {_format_srt_time(group_end)}")
+        lines.append(group_text)
+        lines.append("")
 
     output_path = str(output_path)
     with open(output_path, "w", encoding="utf-8-sig") as f:
@@ -342,12 +345,3 @@ def _format_srt_time(seconds):
     s = int(seconds % 60)
     ms = int((seconds - int(seconds)) * 1000)
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
-
-
-def _format_ass_time(seconds):
-    """Convert seconds to ASS time format: H:MM:SS.cc"""
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = int(seconds % 60)
-    cs = int((seconds - int(seconds)) * 100)
-    return f"{h}:{m:02d}:{s:02d}.{cs:02d}"

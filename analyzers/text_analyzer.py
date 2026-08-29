@@ -9,10 +9,17 @@ import json
 import os
 import re
 import time
+from urllib.parse import urlparse
 
 import httpx
 
 import config
+
+# Provider keys-page hints for HTTP 403 errors (host -> URL).
+_KEYS_HINT = {
+    "openrouter.ai": "openrouter.ai/keys",
+    "opencode.ai": "opencode.ai/auth",
+}
 
 PROMPT_SCENE_SPLIT_OR_KEEP = (
     "Ты анализируешь сцену из фильма «{movie_title}» для YouTube Shorts.\n"
@@ -54,6 +61,16 @@ PROMPT_SCENE_SPLIT_OR_KEEP = (
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+_TRANSIENT_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
+
+
+def _is_transient_error(exc):
+    resp = getattr(exc, "response", None)
+    if resp is None:
+        return True   # network error / timeout / malformed payload -> retry justified
+    return getattr(resp, "status_code", 0) in _TRANSIENT_STATUSES
+
+
 def _call_gemini_api(prompt_text: str, api_key: str, max_tokens: int = 256) -> str:
     """Send a prompt to Google AI Gemini and return raw response text."""
     base = config.LLM_BASE_URL.rstrip("/")
@@ -68,6 +85,7 @@ def _call_gemini_api(prompt_text: str, api_key: str, max_tokens: int = 256) -> s
 
     last_exc: Exception | None = None
     quota_exhausted = False
+    attempts = 0
     for attempt in range(3):
         try:
             resp = httpx.post(url, json=body, headers=headers, timeout=120)
@@ -82,16 +100,22 @@ def _call_gemini_api(prompt_text: str, api_key: str, max_tokens: int = 256) -> s
             data = resp.json()
             return data["candidates"][0]["content"]["parts"][0]["text"].strip()
         except (httpx.HTTPError, KeyError, IndexError) as exc:
+            attempts = attempt + 1
             last_exc = exc
             if hasattr(exc, 'response') and exc.response is not None:
                 if exc.response.status_code in (429, 403):
                     quota_exhausted = True
+            if not _is_transient_error(exc):
+                break
             if attempt < 2:
                 time.sleep(2)
 
-    msg = f"Gemini API failed after 3 attempts: {last_exc}"
+    msg = f"Gemini API failed after {attempts} attempt{'s' if attempts != 1 else ''}: {last_exc}"
     if quota_exhausted:
         msg += " (QUOTA_EXHAUSTED)"
+    if isinstance(last_exc, httpx.HTTPStatusError) and last_exc.response.status_code == 403:
+        keys_url = _KEYS_HINT.get(urlparse(base).netloc, "проверь ключ у провайдера")
+        msg += f"; проверь ключ: {keys_url}"
     raise RuntimeError(msg)
 
 
@@ -127,6 +151,7 @@ def _call_yandex_api(prompt_text: str, api_key: str = "", max_tokens: int = 256,
 
     last_exc: Exception | None = None
     quota_exhausted = False
+    attempts = 0
     for attempt in range(3):
         try:
             resp = httpx.post(url, json=body, headers=headers, timeout=120)
@@ -143,16 +168,185 @@ def _call_yandex_api(prompt_text: str, api_key: str = "", max_tokens: int = 256,
                 raise RuntimeError(f"Yandex API returned null content (response: {resp.status_code})")
             return content.strip()
         except Exception as exc:
+            attempts = attempt + 1
             last_exc = exc
             if hasattr(exc, 'response') and exc.response is not None:
                 if exc.response.status_code in (429, 403):
                     quota_exhausted = True
+            if not _is_transient_error(exc):
+                break
             if attempt < 2:
                 time.sleep(2)
 
-    msg = f"Yandex API failed after 3 attempts: {last_exc}"
+    msg = f"Yandex API failed after {attempts} attempt{'s' if attempts != 1 else ''}: {last_exc}"
     if quota_exhausted:
         msg += " (QUOTA_EXHAUSTED)"
+    if isinstance(last_exc, httpx.HTTPStatusError) and last_exc.response.status_code == 403:
+        keys_url = _KEYS_HINT.get(urlparse(base_url).netloc, "проверь ключ у провайдера")
+        msg += f"; проверь ключ: {keys_url}"
+    raise RuntimeError(msg)
+
+
+# ---------------------------------------------------------------------------
+# OpenRouter API
+# ---------------------------------------------------------------------------
+
+def _call_openrouter_api(prompt_text: str, api_key: str = "", max_tokens: int = 256, model: str = "") -> str:
+    """Call OpenRouter (OpenAI-compatible chat/completions API)."""
+    if not api_key:
+        api_key = getattr(config, 'OPENROUTER_API_KEY', '') or os.environ.get('OPENROUTER_API_KEY', '')
+    if not model:
+        model = getattr(config, 'OPENROUTER_MODEL', 'deepseek/deepseek-chat-v3-0324')
+    base_url = getattr(config, 'OPENROUTER_BASE_URL', 'https://openrouter.ai/api/v1')
+
+    print(f"  OpenRouter model: {model} (key: ...{api_key[-4:] if api_key else '(no key)'})")
+
+    if not api_key:
+        raise RuntimeError("OpenRouter API key not set")
+
+    url = f"{base_url}/chat/completions"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+        # Optional attribution headers per OpenRouter docs
+        "HTTP-Referer": "https://github.com/zhistokoepvpp-ctrl/MovieShort-AI",
+        "X-Title": "MovieShort AI",
+    }
+    body = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt_text}],
+        "temperature": 0.3,
+        "max_tokens": max_tokens,
+    }
+
+    last_exc: Exception | None = None
+    quota_exhausted = False
+    attempts = 0
+    for attempt in range(3):
+        try:
+            resp = httpx.post(url, json=body, headers=headers, timeout=120)
+            if resp.status_code == 429:
+                if attempt < 2:
+                    time.sleep(5 * (attempt + 1))
+                    continue
+                else:
+                    resp.raise_for_status()
+            resp.raise_for_status()
+            data = resp.json()
+            content = data["choices"][0]["message"]["content"]
+            if content is None:
+                raise RuntimeError(f"OpenRouter API returned null content (response: {resp.status_code})")
+            return content.strip()
+        except Exception as exc:
+            attempts = attempt + 1
+            last_exc = exc
+            if hasattr(exc, 'response') and exc.response is not None:
+                if exc.response.status_code in (429, 403):
+                    quota_exhausted = True
+            if not _is_transient_error(exc):
+                break
+            if attempt < 2:
+                time.sleep(2)
+
+    msg = f"OpenRouter API failed after {attempts} attempt{'s' if attempts != 1 else ''}: {last_exc}"
+    if quota_exhausted:
+        msg += " (QUOTA_EXHAUSTED)"
+    if isinstance(last_exc, httpx.HTTPStatusError):
+        # Show the real reason from the OpenRouter response body (error.message),
+        # degrade silently to the generic message on malformed/non-JSON bodies.
+        try:
+            err_data = last_exc.response.json()
+            server_reason = str(err_data["error"]["message"])[:200]
+            msg += f"; причина от сервера: {server_reason}"
+        except Exception:
+            pass
+    if isinstance(last_exc, httpx.HTTPStatusError) and last_exc.response.status_code == 403:
+        keys_url = _KEYS_HINT.get(urlparse(base_url).netloc, "проверь ключ у провайдера")
+        msg += f"; проверь ключ: {keys_url}"
+        # stealth/ox-alpha 403s are usually an account-level model opt-in
+        # issue, not a bad key — point at privacy settings too (todo 43).
+        try:
+            msg += ("; модель stealth/ox-alpha может требовать включения в настройках "
+                    "аккаунта OpenRouter (openrouter.ai/settings/privacy) или выберите "
+                    "другую модель в выпадающем списке")
+        except Exception:
+            pass
+    raise RuntimeError(msg)
+
+
+# ---------------------------------------------------------------------------
+# OpenCode Zen API (https://opencode.ai/zen/v1 — OpenAI-compatible)
+# ---------------------------------------------------------------------------
+
+def _call_opencode_zen_api(prompt_text: str, api_key: str = "", max_tokens: int = 256, model: str = "") -> str:
+    """Call OpenCode Zen (OpenAI-compatible chat/completions API)."""
+    if not api_key:
+        api_key = getattr(config, 'OPENCODE_ZEN_API_KEY', '') or os.environ.get('OPENCODE_ZEN_API_KEY', '')
+    if not model:
+        model = getattr(config, 'OPENCODE_ZEN_MODEL', 'nemotron-3-ultra-free')
+    base_url = getattr(config, 'OPENCODE_ZEN_BASE_URL', 'https://opencode.ai/zen/v1')
+
+    print(f"  OpenCode Zen model: {model} (key: ...{api_key[-4:] if api_key else '(no key)'})")
+
+    if not api_key:
+        raise RuntimeError("OpenCode Zen API key not set")
+
+    url = f"{base_url}/chat/completions"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+        "HTTP-Referer": "https://github.com/zhistokoepvpp-ctrl/MovieShort-AI",
+        "X-Title": "MovieShort AI",
+    }
+    body = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt_text}],
+        "temperature": 0.3,
+        "max_tokens": max_tokens,
+    }
+
+    last_exc: Exception | None = None
+    quota_exhausted = False
+    attempts = 0
+    for attempt in range(3):
+        try:
+            resp = httpx.post(url, json=body, headers=headers, timeout=120)
+            if resp.status_code == 429:
+                if attempt < 2:
+                    time.sleep(5 * (attempt + 1))
+                    continue
+                else:
+                    resp.raise_for_status()
+            resp.raise_for_status()
+            data = resp.json()
+            content = data["choices"][0]["message"]["content"]
+            if content is None:
+                raise RuntimeError(f"OpenCode Zen API returned null content (response: {resp.status_code})")
+            return content.strip()
+        except Exception as exc:
+            attempts = attempt + 1
+            last_exc = exc
+            if hasattr(exc, 'response') and exc.response is not None:
+                if exc.response.status_code in (429, 403):
+                    quota_exhausted = True
+            if not _is_transient_error(exc):
+                break
+            if attempt < 2:
+                time.sleep(2)
+
+    msg = f"OpenCode Zen API failed after {attempts} attempt{'s' if attempts != 1 else ''}: {last_exc}"
+    if quota_exhausted:
+        msg += " (QUOTA_EXHAUSTED — смените модель на nemotron-3-ultra-free)"
+    if isinstance(last_exc, httpx.HTTPStatusError):
+        try:
+            err_data = last_exc.response.json()
+            server_reason = str(err_data["error"]["message"])[:200]
+            msg += f"; причина от сервера: {server_reason}"
+        except Exception:
+            pass
+    if isinstance(last_exc, httpx.HTTPStatusError) and last_exc.response.status_code == 403:
+        keys_url = _KEYS_HINT.get(urlparse(base_url).netloc, "проверь ключ у провайдера")
+        msg += f"; проверь ключ: {keys_url}"
     raise RuntimeError(msg)
 
 
@@ -161,11 +355,15 @@ def _call_yandex_api(prompt_text: str, api_key: str = "", max_tokens: int = 256,
 # ---------------------------------------------------------------------------
 
 def call_llm(prompt_text: str, api_key: str = "", provider: str = "", max_tokens: int = 256) -> str:
-    """Unified LLM call — routes to Gemini or Yandex based on provider."""
+    """Unified LLM call — routes to Gemini, Yandex, OpenRouter or OpenCode Zen based on provider."""
     if not provider:
         provider = getattr(config, 'LLM_PROVIDER', 'gemini')
     if provider == "yandex":
         return _call_yandex_api(prompt_text, api_key, max_tokens=max_tokens)
+    elif provider == "openrouter":
+        return _call_openrouter_api(prompt_text, api_key, max_tokens=max_tokens)
+    elif provider == "opencode_zen":
+        return _call_opencode_zen_api(prompt_text, api_key, max_tokens=max_tokens)
     else:
         return _call_gemini_api(prompt_text, api_key, max_tokens=max_tokens)
 
@@ -255,7 +453,7 @@ def _parse_batch_response(raw: str, expected: int) -> list[dict] | None:
 
 
 def check_api_key(api_key: str, provider: str = "") -> dict:
-    """Check if the API key is valid. Supports both Gemini and Yandex.
+    """Check if the API key is valid. Supports Gemini, Yandex, OpenRouter and OpenCode Zen.
 
     Returns:
         {"ok": True} if key works,
@@ -265,6 +463,10 @@ def check_api_key(api_key: str, provider: str = "") -> dict:
         provider = getattr(config, 'LLM_PROVIDER', 'gemini')
     if provider == "yandex":
         return _check_yandex_key(api_key)
+    elif provider == "openrouter":
+        return _check_openrouter_key(api_key)
+    elif provider == "opencode_zen":
+        return _check_opencode_zen_key(api_key)
     else:
         return _check_gemini_key(api_key)
 
@@ -325,6 +527,54 @@ def _check_yandex_key(api_key: str) -> dict:
         if "429" in err:
             return {"ok": False, "error": "Yandex: превышен лимит запросов"}
         return {"ok": False, "error": f"Yandex: {err[:80]}"}
+
+
+def _check_openrouter_key(api_key: str) -> dict:
+    """Check OpenRouter API key."""
+    if not api_key or not api_key.strip():
+        return {"ok": False, "error": "OpenRouter API ключ не задан"}
+
+    try:
+        # Pin a non-reasoning probe model: config default stealth/ox-alpha is
+        # reasoning-mandatory — max_tokens=16 burns on reasoning, content comes
+        # back null and the null-content guard reports a false key failure.
+        _call_openrouter_api("Скажи OK", api_key, max_tokens=16,
+                             model="deepseek/deepseek-chat-v3-0324")
+        return {"ok": True}
+    except Exception as e:
+        err = str(e)
+        if "401" in err or "auth" in err.lower():
+            return {"ok": False, "error": "OpenRouter: неверный ключ"}
+        if "403" in err:
+            return {"ok": False, "error": ("OpenRouter: доступ запрещён — проверь права ключа на выбранную модель "
+                                           "(permissions/guardrail/moderation); модель stealth/ox-alpha может "
+                                           "требовать включения в настройках аккаунта OpenRouter "
+                                           "(openrouter.ai/settings/privacy) или выберите другую модель "
+                                           "в выпадающем списке")}
+        if "429" in err:
+            return {"ok": False, "error": "OpenRouter: превышен лимит запросов"}
+        return {"ok": False, "error": f"OpenRouter: {err[:80]}"}
+
+
+def _check_opencode_zen_key(api_key: str) -> dict:
+    """Check OpenCode Zen API key."""
+    if not api_key or not api_key.strip():
+        return {"ok": False, "error": "OpenCode Zen API ключ не задан"}
+
+    try:
+        # Pin default free model with minimal tokens (null-content guard needs real content)
+        _call_opencode_zen_api("Скажи OK", api_key, max_tokens=16,
+                               model="nemotron-3-ultra-free")
+        return {"ok": True}
+    except Exception as e:
+        err = str(e)
+        if "401" in err or "auth" in err.lower():
+            return {"ok": False, "error": "OpenCode Zen: неверный ключ"}
+        if "403" in err:
+            return {"ok": False, "error": ("OpenCode Zen: доступ запрещён — проверь ключ: opencode.ai/auth")}
+        if "429" in err:
+            return {"ok": False, "error": "OpenCode Zen: превышен лимит запросов — смените модель на nemotron-3-ultra-free"}
+        return {"ok": False, "error": f"OpenCode Zen: {err[:80]}"}
 
 
 # ---------------------------------------------------------------------------

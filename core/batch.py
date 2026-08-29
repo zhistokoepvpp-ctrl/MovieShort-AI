@@ -16,6 +16,31 @@ from core.subtitle import load_segments_json
 from utils import get_video_basename
 
 
+# credits/music filter — R7b-6
+_CREDITS_RE = re.compile(r'редактор|корректор|субтитров|телефон', re.I)
+
+
+def _is_credit_or_silent(block):
+    """True if block should be filtered: no text, <30 chars, credits, or silence_ratio>0.85."""
+    text = (block.get("text") or "").strip()
+    if not text or len(text) < 30 or _CREDITS_RE.search(text):
+        return True
+    audio_peaks = block.get("audio_peaks") or {}
+    if audio_peaks.get("silence_ratio", 0) > 0.85:
+        return True
+    return False
+
+
+def _resolve_movie_title(settings, video_path):
+    """User title if given; else filename stem (with a visibility warning —
+    renamed files leak garbage into the LLM prompt)."""
+    raw = (settings.get("movie_title") or "").strip()
+    title = raw or Path(video_path).stem
+    if not raw:
+        print(f"⚠ Точное название фильма не задано — в анализ передано имя файла «{title}». Укажите название для лучшего качества.")
+    return title
+
+
 def process_movie(video_path, settings=None):
     """
     Full auto pipeline: analyze movie → find best clips → process each → output.
@@ -51,7 +76,7 @@ def process_movie(video_path, settings=None):
     film_language = settings.get("film_language", "ru")
 
     video_path = str(video_path)
-    movie_title = settings.get("movie_title", "") or Path(video_path).stem
+    movie_title = _resolve_movie_title(settings, video_path)
     # Sanitize for folder name (remove chars invalid on Windows)
     safe_name = re.sub(r'[\\/:*?"<>|]', '', movie_title).strip() or "untitled"
 
@@ -117,7 +142,7 @@ def process_movie(video_path, settings=None):
     video_basename = get_video_basename(video_path)
     hash_input = f"{video_path}_{film_language}_{config.WHISPER_MODEL}"
     file_hash = hashlib.md5(hash_input.encode()).hexdigest()[:8]
-    expected = str(config.TEMP_DIR / f"full_transcript_{video_basename}_{file_hash}.json")
+    expected = str(config.CACHE_DIR / f"full_transcript_{video_basename}_{file_hash}.json")
     if os.path.exists(expected):
         transcript_json = expected
         print(f"Found pre-transcribed transcript: full_transcript_{video_basename}_{file_hash}.json")
@@ -160,11 +185,16 @@ def process_movie(video_path, settings=None):
         "subtitles": subtitles,
         "face_tracking": face_tracking,
         "max_duration": max_duration,
+        "movie_title": movie_title,
         "anti_copyright": settings.get("anti_copyright", config.DEFAULT_ANTI_COPYRIGHT),
         "blur_background": settings.get("blur_background", config.DEFAULT_BLUR_BACKGROUND),
         "banner_top": settings.get("banner_top", config.DEFAULT_BANNER_TOP),
         "banner_bottom": settings.get("banner_bottom", config.DEFAULT_BANNER_BOTTOM),
     }
+    # R7b-7: Editor subtitle style flows to final clips (same font_style path as render_full_preview)
+    for _k in ("subtitle_font", "subtitle_font_name", "subtitle_size", "subtitle_outline", "subtitle_color", "subtitle_bold", "subtitle_italic", "subtitle_shadow", "subtitle_position_y", "font_style"):
+        if _k in settings and settings[_k] is not None:
+            base_options[_k] = settings[_k]
     if transcript_json:
         base_options["transcript_path"] = transcript_json
 
@@ -217,8 +247,17 @@ def process_movie(video_path, settings=None):
         else:
             print(f"  ❌ clip {i+1} — failed")
 
-    # Auto-cleanup: delete temp files if enabled
-    if settings.get("auto_cleanup", False) and os.path.exists(config.TEMP_DIR):
+    # Auto-cleanup: delete temp files if enabled.
+    # CACHE_DIR survives auto_cleanup by design (reusable transcripts/person/RMS caches).
+    if settings.get("auto_cleanup", True):
+        cleanup_temp_dir()
+
+    return results
+
+
+def cleanup_temp_dir():
+    """Wipe ONLY output/temp contents; never touches config.CACHE_DIR."""
+    if os.path.exists(config.TEMP_DIR):
         for f in os.listdir(str(config.TEMP_DIR)):
             fp = os.path.join(str(config.TEMP_DIR), f)
             try:
@@ -229,8 +268,6 @@ def process_movie(video_path, settings=None):
             except Exception:
                 pass
         print(f"  🧹 Временные файлы удалены")
-
-    return results
 
 
 def _format_time(seconds):
@@ -425,6 +462,74 @@ def _merge_blocks_for_llm(blocks, target_duration=120, max_duration=150):
     return merged
 
 
+# --- Model-aware batch sizing + prompt budget guard (T5) ---
+
+# Chars per block around the dialogue (timestamps, labels, joiner) — estimate
+_BLOCK_FRAMING_CHARS = 200
+# Minimum dialogue chars kept when a single-block batch still overflows the budget
+_TRUNCATE_FLOOR_CHARS = 200
+
+
+def _batch_size_for_model(model):
+    """Blocks per LLM call for the given model (default 2 for unknown models)."""
+    return config.MODEL_BATCH_SIZES.get(model, config.DEFAULT_LLM_BATCH_SIZE)
+
+
+def _max_prompt_chars(model):
+    """Prompt char budget: context tokens * chars/token estimate * input share."""
+    ctx = config.MODEL_CONTEXT_TOKENS.get(model, config.DEFAULT_CONTEXT_TOKENS)
+    return int(ctx * config.PROMPT_CHARS_PER_TOKEN * config.PROMPT_INPUT_BUDGET)
+
+
+def _prompt_content_chars(batch_blocks):
+    """Estimated prompt chars contributed by a batch's blocks (framing + dialogue)."""
+    return sum(
+        _BLOCK_FRAMING_CHARS + len(b.get("text", "").strip() or "(нет диалога)")
+        for b in batch_blocks
+    )
+
+
+def _truncate_batch(chunk, content_budget):
+    """Proportionally truncate each block's dialogue so the chunk fits content_budget.
+
+    Returns shallow copies — input blocks are never mutated. Floor 200 chars wins.
+    """
+    dialogues = [b.get("text", "").strip() or "(нет диалога)" for b in chunk]
+    dialogue_total = sum(len(d) for d in dialogues)
+    fixed = _prompt_content_chars(chunk) - dialogue_total
+    available = content_budget - fixed
+    share = available / dialogue_total if dialogue_total > 0 else 0.0
+    out = []
+    for b, d in zip(chunk, dialogues):
+        keep = max(_TRUNCATE_FLOOR_CHARS, int(len(d) * share))
+        trimmed = dict(b)
+        trimmed["text"] = d[:keep]
+        out.append(trimmed)
+    return out
+
+
+def _split_batches(blocks, batch_size, content_budget):
+    """Cursor-based split of blocks into LLM batches fitting content_budget.
+
+    While a batch overflows and size > 1 → halve size and re-split the remainder.
+    A size-1 overflow gets proportional dialogue truncation. Pure: never mutates
+    input blocks; oversized batches come back as shallow copies with cut text.
+    """
+    batches = []
+    cursor = 0
+    size = max(1, batch_size)
+    while cursor < len(blocks):
+        while (_prompt_content_chars(blocks[cursor:cursor + size]) > content_budget
+               and size > 1):
+            size //= 2
+        chunk = blocks[cursor:cursor + size]
+        if _prompt_content_chars(chunk) > content_budget:
+            chunk = _truncate_batch(chunk, content_budget)
+        batches.append(chunk)
+        cursor += len(chunk)
+    return batches
+
+
 def find_best_clips_context(video_path, movie_title, api_key, provider="gemini",
                             max_duration=60, min_duration=15,
                             num_clips=10, score_threshold=7.0, language="ru"):
@@ -476,33 +581,42 @@ def find_best_clips_context(video_path, movie_title, api_key, provider="gemini",
     print(f"  Merged {before_merge} → {len(blocks)} super-blocks "
           f"(target 120s, range 90-150s)")
 
-    # Step 1.6: Filter out silent blocks (no dialogue) — user doesn't want clips from them
+    # Step 1.6: Filter out silent / credits / music blocks
     before_filter = len(blocks)
-    blocks = [b for b in blocks if b.get("text", "").strip()]
-    filtered_silent = before_filter - len(blocks)
-    if filtered_silent:
-        print(f"  Filtered out {filtered_silent} silent block(s) (no dialogue)")
+    blocks = [b for b in blocks if not _is_credit_or_silent(b)]
+    filtered = before_filter - len(blocks)
+    if filtered:
+        print(f"  Filtered out {filtered} credit/silent block(s)")
 
     if not blocks:
         print("  No blocks with dialogue — nothing to process")
         return None
 
-    BATCH_SIZE = 2
+    if provider == "yandex":
+        model = config.YANDEX_MODEL
+    elif provider == "openrouter":
+        model = getattr(config, 'OPENROUTER_MODEL', '')
+    elif provider == "opencode_zen":
+        model = getattr(config, 'OPENCODE_ZEN_MODEL', '')
+    else:
+        model = config.LLM_MODEL
+    batch_size = _batch_size_for_model(model)
     batch_template = PROMPT_BATCH_TO_CLIPS if language == "ru" else PROMPT_BATCH_TO_CLIPS_EN
     all_sub_clips = []
-    total_batches = (len(blocks) + BATCH_SIZE - 1) // BATCH_SIZE
+    batches = _split_batches(blocks, batch_size,
+                             _max_prompt_chars(model) - len(batch_template))
+    total_batches = len(batches)
 
     # Step 2: Process blocks in batches through LLM
-    print(f"[Context] Processing {len(blocks)} blocks in batches of {BATCH_SIZE} "
-          f"(~{total_batches} LLM calls)...")
-    for batch_idx in range(0, len(blocks), BATCH_SIZE):
-        batch_blocks = blocks[batch_idx:batch_idx + BATCH_SIZE]
-        batch_num = batch_idx // BATCH_SIZE + 1
+    print(f"[Context] Processing {len(blocks)} blocks in batches of {batch_size} "
+          f"(model: {model}, ~{total_batches} LLM calls)...")
+    batch_start = 0
+    for batch_num, batch_blocks in enumerate(batches, 1):
 
         # Build blocks_text for the combined prompt
         block_texts = []
         for i, block in enumerate(batch_blocks):
-            global_idx = batch_idx + i
+            global_idx = batch_start + i
             block_start = block["start"]
             block_end = block["end"]
             block_dur = block_end - block_start
@@ -537,7 +651,7 @@ def find_best_clips_context(video_path, movie_title, api_key, provider="gemini",
         )
 
         print(f"\n  ── Batch {batch_num}/{total_batches} "
-              f"(blocks {batch_idx+1}-{batch_idx+len(batch_blocks)}) ──")
+              f"(blocks {batch_start+1}-{batch_start+len(batch_blocks)}) ──")
 
         # Call LLM once for the entire batch
         raw_response = None
@@ -563,7 +677,7 @@ def find_best_clips_context(video_path, movie_title, api_key, provider="gemini",
 
         # Process each block in the batch
         for i, block in enumerate(batch_blocks):
-            global_idx = batch_idx + i
+            global_idx = batch_start + i
             block_start = block["start"]
             block_end = block["end"]
             block_dur = block_end - block_start
@@ -621,6 +735,7 @@ def find_best_clips_context(video_path, movie_title, api_key, provider="gemini",
 
             all_sub_clips.extend(valid_clips)
 
+        batch_start += len(batch_blocks)
     if not all_sub_clips:
         print("  No valid clips from LLM results")
         return None

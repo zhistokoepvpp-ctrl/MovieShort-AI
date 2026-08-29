@@ -11,10 +11,13 @@ venv/
 env/
 
 # Output files (generated clips)
-output/*
+output/
 !output/.gitkeep
 
-# Media files (large)
+# OpenCode internals
+.omo/
+
+# Media files (large - avoid accidental commit)
 *.mp4
 *.avi
 *.mkv
@@ -34,6 +37,9 @@ models/*.onnx
 models/*.bin
 models/*.pt
 models/*.pth
+
+# Pytest
+.pytest_cache/
 
 # Temp files
 *.tmp

@@ -3,11 +3,15 @@ MovieShort AI — FFmpeg utilities
 """
 from pathlib import Path
 from typing import Optional, Union
+import hashlib
+import os
 import re
 import shutil
 import subprocess
+import time
 
 from config import VERTICAL_WIDTH, VERTICAL_HEIGHT, BANNER_TOP, BANNER_BOTTOM, ANTI_COPYRIGHT, AC_MIRROR, AC_CONTRAST, AC_BRIGHTNESS, AC_SATURATION, SUBTITLE_FONT, SUBTITLE_SIZE, SUBTITLE_COLOR, SUBTITLE_OUTLINE, SUBTITLE_BOLD, SUBTITLE_ITALIC, SUBTITLE_SHADOW
+from utils.font_manager import FONTS_DIR
 
 
 class FFmpegError(Exception):
@@ -90,14 +94,19 @@ def _run(
     args: list,
     desc: str = "ffmpeg",
     cwd: Optional[Union[str, Path]] = None,
+    timeout: Optional[float] = None,
 ) -> subprocess.CompletedProcess:
-    result = subprocess.run(
-        args,
-        capture_output=True,
-        text=True,
-        errors="backslashreplace",
-        cwd=str(cwd) if cwd else None,
-    )
+    try:
+        result = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            errors="backslashreplace",
+            cwd=str(cwd) if cwd else None,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise FFmpegError(f"{desc} timed out after {timeout}s") from e
     if result.returncode != 0:
         raise FFmpegError(
             f"{desc} failed (code {result.returncode}):\n{result.stderr.strip()}"
@@ -151,6 +160,27 @@ def clip_video(
     return out
 
 
+def _build_style_string(fs: dict) -> str:
+    """Build the libass force_style string from a font_style dict.
+
+    Shared by embed_subtitles (production) and render_full_preview
+    so the two filter strings cannot drift. MarginV intentionally omitted —
+    see the note in embed_subtitles.
+    """
+    return (
+        f"FontName={fs.get('font', SUBTITLE_FONT)},"
+        f"FontSize={fs.get('size', SUBTITLE_SIZE)},"
+        f"PrimaryColour={fs.get('color', SUBTITLE_COLOR)},"
+        f"OutlineColour=&H00000000,"
+        f"BackColour=&H00000000,"
+        f"BorderStyle=1,"
+        f"Outline={fs.get('outline', SUBTITLE_OUTLINE)},"
+        f"Shadow={1 if fs.get('shadow', SUBTITLE_SHADOW) else 0},"
+        f"Bold={1 if fs.get('bold', SUBTITLE_BOLD) else 0},"
+        f"Italic={1 if fs.get('italic', SUBTITLE_ITALIC) else 0}"
+    )
+
+
 def embed_subtitles(
     video_path: Union[str, Path],
     subtitle_path: Union[str, Path],
@@ -159,6 +189,7 @@ def embed_subtitles(
     banner_top: int = BANNER_TOP,
     banner_bottom: int = BANNER_BOTTOM,
     gpu_opts=None,
+    fontsdir: Optional[Union[str, Path]] = None,
 ) -> Path:
     _validate_file(video_path, "video_path")
     _validate_file(subtitle_path, "subtitle_path")
@@ -172,26 +203,30 @@ def embed_subtitles(
     # subtitles default to the bottom of the content area — correct position
     # since blur_background overlays content just above the bottom banner.
     content_h = VERTICAL_HEIGHT - banner_top - banner_bottom
-    style = (
-        f"FontName={fs.get('font', SUBTITLE_FONT)},"
-        f"FontSize={fs.get('size', SUBTITLE_SIZE)},"
-        f"PrimaryColour={fs.get('color', SUBTITLE_COLOR)},"
-        f"OutlineColour=&H00000000,"
-        f"BackColour=&H00000000,"
-        f"BorderStyle=1,"
-        f"Outline={fs.get('outline', SUBTITLE_OUTLINE)},"
-        f"Shadow={1 if fs.get('shadow', SUBTITLE_SHADOW) else 0},"
-        f"Bold={1 if fs.get('bold', SUBTITLE_BOLD) else 0},"
-        f"Italic={1 if fs.get('italic', SUBTITLE_ITALIC) else 0}"
-    )
-    # Copy SRT to output directory so we can reference it by filename
-    # (avoids Windows drive-letter colons breaking ffmpeg's filter-parser).
+    style = _build_style_string(fs)
+    # Copy subtitle file to output directory under a FILTER-SAFE name.
+    # out.stem (todo-1 clip names) contains ", " and "#" — an unquoted comma
+    # splits ffmpeg's filtergraph ("No such filter: '...'"), so the copy gets
+    # a content-hashed name instead of deriving from out.stem.
+    # Suffix generalized: .srt and .ass — libass renders ASS natively, and
+    # force_style overrides style-level params but inline {\fad}/{\move} tags survive.
     out_dir = out.parent
-    local_srt = out_dir / f"{out.stem}.srt"
+    safe_stem = hashlib.md5(out.stem.encode("utf-8")).hexdigest()[:12]
+    local_srt = out_dir / f"{safe_stem}{Path(subtitle_path).suffix}"
     shutil.copy2(subtitle_path, local_srt)
     filter_str = (
         "subtitles={}:force_style='{}':original_size=1080x{}"
     ).format(local_srt.name, style, content_h)
+    if fontsdir:
+        # libass font lookup. An ABSOLUTE Windows path carries a drive colon,
+        # which ffmpeg 8.1's filtergraph option splitter eats even when
+        # single-quoted or backslash-escaped (empirically verified) → pass a
+        # path RELATIVE to the ffmpeg cwd (= out_dir), forward slashes, quoted.
+        try:
+            fonts_arg = os.path.relpath(os.path.abspath(fontsdir), out_dir)
+        except ValueError:  # fonts on a different drive than the output
+            fonts_arg = os.path.abspath(fontsdir)
+        filter_str += ":fontsdir='{}'".format(fonts_arg.replace("\\", "/"))
     gpu = _gpu_args(gpu_opts)
     cmd = ["ffmpeg", "-y"]
     if gpu:
@@ -203,7 +238,7 @@ def embed_subtitles(
         str(out),
     ])
     _run(cmd, desc="embed_subtitles", cwd=out_dir)
-    # Clean up the temporary SRT copy
+    # Clean up the temporary subtitle copy
     local_srt.unlink(missing_ok=True)
     return out
 
@@ -326,6 +361,145 @@ def pad_with_banners(
     ])
     _run(cmd, desc="pad_with_banners")
     return out
+
+
+def _probe_duration(video_path: Path) -> float:
+    """Return video duration in seconds via ffprobe."""
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", str(video_path)],
+        capture_output=True, text=True, timeout=30,
+    )
+    if result.returncode != 0:
+        raise FFmpegError(
+            f"ffprobe failed (code {result.returncode}):\n{result.stderr.strip()}"
+        )
+    try:
+        return float(result.stdout.strip())
+    except ValueError as e:
+        raise FFmpegError(f"ffprobe returned no duration for {video_path}") from e
+
+
+def _probe_height(video_path: Path) -> int:
+    """Return video display height in pixels via ffprobe."""
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=height",
+         "-of", "default=noprint_wrappers=1:nokey=1", str(video_path)],
+        capture_output=True, text=True, timeout=30,
+    )
+    if result.returncode != 0:
+        raise FFmpegError(
+            f"ffprobe failed (code {result.returncode}):\n{result.stderr.strip()}"
+        )
+    try:
+        return int(result.stdout.strip().splitlines()[0])
+    except (ValueError, IndexError) as e:
+        raise FFmpegError(f"ffprobe returned no height for {video_path}") from e
+
+
+def render_full_preview(
+    video_path: Union[str, Path],
+    srt_or_ass_path: Optional[Union[str, Path]],
+    style_params: Optional[dict],
+    options: dict,
+    output_dir: Union[str, Path],
+) -> str:
+    """Render the FULL test video through the complete production chain
+    (mirrors core/pipeline.py process_clip steps 3-5) and return the
+    output .mp4 path.
+
+    Chain:
+      1. vertical: face_tracking → processor.apply_vertical_crop (lazy
+         function-body import — core.processor imports ffmpeg_utils, a
+         module-level import here would be circular); else
+         convert_to_vertical(anti_copyright=...).
+      2. subtitles: embed_subtitles with the editor style —
+         skipped when srt_or_ass_path is None/empty.
+      3. final frame: blur_background(enabled=blur) | pad_with_banners.
+
+    NO -ss and NO -t anywhere: full source duration flows through, so the
+    preview is exactly what production would produce for this settings set.
+
+    options keys: banner_top:int, banner_bottom:int, blur:bool,
+    anti_copyright:bool, face_tracking:bool.
+
+    Timeout budget is max(180, duration*8)s per stage (computed once from
+    _probe_duration). The chain helpers (convert_to_vertical /
+    embed_subtitles / blur_background / pad_with_banners /
+    apply_vertical_crop) do not expose a timeout parameter, so the budget
+    cannot be threaded through them — they rely on their internal _run
+    behavior; this function makes no direct ffmpeg subprocess calls itself.
+
+    Intermediate files live in output_dir under unique timestamped names
+    and are removed in a finally block.
+    """
+    # os.path.abspath, NOT Path.resolve() — Python 3.9/Windows resolve() of a
+    # NONEXISTENT relative path returns it unchanged (still relative).
+    video_path = os.path.abspath(video_path)
+    _validate_file(video_path, "video_path")
+    if srt_or_ass_path:
+        srt_or_ass_path = os.path.abspath(srt_or_ass_path)
+        _validate_file(srt_or_ass_path, "srt_or_ass_path")
+    out_dir = Path(os.path.abspath(output_dir))
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    banner_top = int(options.get("banner_top", BANNER_TOP))
+    banner_bottom = int(options.get("banner_bottom", BANNER_BOTTOM))
+    blur = bool(options.get("blur", True))
+    anti_copyright = bool(options.get("anti_copyright", ANTI_COPYRIGHT))
+    face_tracking = bool(options.get("face_tracking", False))
+
+    gpu_opts = _detect_gpu_accel()
+    # Timeout budget per stage would be max(180, int(duration * 8))s, but the
+    # chain helpers expose no timeout parameter (see docstring) — no direct
+    # ffmpeg subprocess calls are made here, so nothing to thread it into.
+
+    # Timestamped names: reruns never collide with a file Gradio is still serving.
+    base = f"{Path(video_path).stem}_preview_{int(time.time() * 1000)}"
+    tmp_vert = out_dir / f"{base}_vert.mp4"
+    tmp_subs = out_dir / f"{base}_subs.mp4"
+    out_mp4 = out_dir / f"{base}.mp4"
+    try:
+        # Step 1: vertical content area (1080 x content_h)
+        if face_tracking:
+            # Lazy import to avoid circular import (processor → ffmpeg_utils).
+            from core.processor import apply_vertical_crop
+            apply_vertical_crop(
+                video_path, str(tmp_vert),
+                anti_copyright=anti_copyright,
+                banner_top=banner_top, banner_bottom=banner_bottom)
+        else:
+            convert_to_vertical(
+                video_path, tmp_vert,
+                anti_copyright=anti_copyright,
+                banner_top=banner_top, banner_bottom=banner_bottom,
+                gpu_opts=gpu_opts)
+
+        # Step 2: subtitles on the content-area video (before banner padding)
+        content_src = tmp_vert
+        if srt_or_ass_path:
+            embed_subtitles(
+                tmp_vert, srt_or_ass_path, tmp_subs,
+                font_style=style_params,
+                banner_top=banner_top, banner_bottom=banner_bottom,
+                gpu_opts=gpu_opts,
+                fontsdir=os.path.abspath(FONTS_DIR))
+            content_src = tmp_subs
+
+        # Step 3: full 9:16 frame
+        if blur:
+            blur_background(content_src, out_mp4, enabled=True,
+                            banner_top=banner_top, banner_bottom=banner_bottom,
+                            gpu_opts=gpu_opts)
+        else:
+            pad_with_banners(content_src, out_mp4,
+                             banner_top=banner_top, banner_bottom=banner_bottom,
+                             gpu_opts=gpu_opts)
+    finally:
+        tmp_vert.unlink(missing_ok=True)
+        tmp_subs.unlink(missing_ok=True)
+    return str(out_mp4)
 
 
 

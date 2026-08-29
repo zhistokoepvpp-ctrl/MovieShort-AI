@@ -4,12 +4,13 @@ MovieShort AI — Configuration
 from pathlib import Path
 
 # App version
-APP_VERSION = "1.5.0"
+APP_VERSION = "2.0"
 
 # Paths
 BASE_DIR = Path(__file__).parent
 OUTPUT_DIR = BASE_DIR / "output"
 TEMP_DIR = OUTPUT_DIR / "temp"
+CACHE_DIR = OUTPUT_DIR / "cache"  # reusable caches (transcripts, person/RMS) — survives auto_cleanup
 
 # Whisper settings
 WHISPER_MODEL = "medium"        # tiny/base/small/medium/large-v3
@@ -68,7 +69,7 @@ SUBTITLE_ITALIC = False
 SUBTITLE_SHADOW = False
 SUBTITLE_POSITION_Y = 400       # px from bottom
 
-# LLM Provider: "gemini" or "yandex"
+# LLM Provider: "gemini", "yandex", "openrouter" or "opencode_zen"
 LLM_PROVIDER = "gemini"
 
 # API key (set in Settings → API Key inside the app, or in user_config.json)
@@ -92,6 +93,56 @@ YANDEX_MODEL_LIST = [
     "gpt-oss-20b",             # OSS 20B, 128K
 ]
 YANDEX_BASE_URL = "https://ai.api.cloud.yandex.net/v1"
+
+# LLM batching by model context (task: fewer paid calls for long-context models)
+MODEL_BATCH_SIZES = {"deepseek-v4-flash": 8}
+DEFAULT_LLM_BATCH_SIZE = 2
+MODEL_CONTEXT_TOKENS = {"deepseek-v4-flash": 1000000}
+DEFAULT_CONTEXT_TOKENS = 32000
+PROMPT_CHARS_PER_TOKEN = 2.5     # оценка для русскоязычного диалога
+PROMPT_INPUT_BUDGET = 0.5        # половина контекста на вход (остаток: выход 4096 + оверхед)
+
+# OpenRouter provider (https://openrouter.ai) — release provider
+OPENROUTER_API_KEY = ""   # реальный ключ живёт в user_config.json ("openrouter_api_key"); в config.py НЕ вписывать
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+OPENROUTER_MODEL = "stealth/ox-alpha"
+OPENROUTER_MODEL_LIST = [
+    # stealth/ox-alpha — Ox Alpha: free, 1M ctx (catalog verified 2026-08)
+    "stealth/ox-alpha",
+    "deepseek/deepseek-chat-v3-0324",
+    "deepseek/deepseek-r1",
+    "google/gemini-2.0-flash-001",
+    "google/gemini-2.5-flash-preview",
+    "meta-llama/llama-3.3-70b-instruct",
+    "meta-llama/llama-4-maverick",
+    "qwen/qwen-2.5-72b-instruct",
+    "qwen/qwen3-235b-a22b",
+    "mistralai/mistral-large-2411",
+    "microsoft/wizardlm-2-8x22b",
+    "nousresearch/hermes-3-llama-3.1-405b",
+]
+
+# OpenCode Zen provider (https://opencode.ai) — free models via OpenAI-compatible /zen/v1
+OPENCODE_ZEN_API_KEY = ""   # реальный ключ живёт в user_config.json ("opencode_zen_api_key"); в config.py НЕ вписывать
+OPENCODE_ZEN_BASE_URL = "https://opencode.ai/zen/v1"
+OPENCODE_ZEN_MODEL = "nemotron-3-ultra-free"
+OPENCODE_ZEN_MODEL_LIST = [
+    "nemotron-3-ultra-free",        # 1M ctx (max headroom, default)
+    "big-pickle",                   # 200K (stealth wrapper over mimo-v2.5)
+    "mimo-v2.5-free",               # 200K
+    "hy3-free",                     # 190K
+    "nemotron-3.5-lightning-free",  # 262K
+]
+OPENCODE_ZEN_MODEL_CONTEXT_TOKENS = {
+    "nemotron-3-ultra-free": 1000000,
+    "big-pickle": 200000,
+    "mimo-v2.5-free": 200000,
+    "hy3-free": 190000,
+    "nemotron-3.5-lightning-free": 262000,
+}
+
+# YouTube Shorts output filename hashtags (empty since R7b-9 — no hashtags in clip names)
+HASHTAGS = ""
 
 # Analysis modes
 ANALYSIS_MODES = ["standard", "context"]

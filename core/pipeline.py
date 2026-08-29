@@ -19,6 +19,115 @@ from core.subtitle import (
     load_segments_json, filter_segments_in_range
 )
 from core.processor import apply_vertical_crop
+from utils.font_manager import FONTS_DIR, ensure_font
+
+
+def _resolve_font_style(options):
+    """Build font_style dict from pipeline options (R7b-7).
+
+    Priority:
+      1. options["font_style"] if present (gui wired Editor controls already).
+      2. subtitle_* flat keys (subtitle_font / subtitle_font_name etc.) — build dict + ensure_font.
+      3. fallback to user_config.load() (same _get_font_style path as preview via gui/app.py helper).
+    Shared path with render_full_preview: both ultimately call ffmpeg_utils._build_style_string.
+    """
+    if options.get("font_style"):
+        return options["font_style"]
+    has_subtitle_keys = any(k.startswith("subtitle_") for k in options)
+    if has_subtitle_keys:
+        font = options.get("subtitle_font")
+        if not font:
+            name = options.get("subtitle_font_name") or "Arial"
+            try:
+                font = ensure_font(name, FONTS_DIR)
+            except Exception:
+                font = name
+        return {
+            "font": font,
+            "size": options.get("subtitle_size", 13),
+            "color": options.get("subtitle_color", "&H00FFFFFF"),
+            "outline": options.get("subtitle_outline", 1),
+            "bold": options.get("subtitle_bold", True),
+            "italic": options.get("subtitle_italic", False),
+            "shadow": options.get("subtitle_shadow", False),
+            "position_y": options.get("subtitle_position_y", 400),
+        }
+    try:
+        from utils import user_config
+        cfg = user_config.load()
+        return {
+            "font": cfg.get("subtitle_font", "Arial"),
+            "size": cfg.get("subtitle_size", 13),
+            "color": cfg.get("subtitle_color", "&H00FFFFFF"),
+            "outline": cfg.get("subtitle_outline", 1),
+            "bold": cfg.get("subtitle_bold", True),
+            "italic": cfg.get("subtitle_italic", False),
+            "shadow": cfg.get("subtitle_shadow", False),
+            "position_y": cfg.get("subtitle_position_y", 400),
+        }
+    except Exception:
+        return None
+
+
+def _write_subtitles(segments, base_path):
+    """Write word-group subtitles next to base_path (no extension).
+
+    Always SRT (subtitle animations removed in v2.0, todo 47).
+    """
+    srt_path = base_path + ".srt"
+    generate_word_group_srt(segments, srt_path)
+    return srt_path
+
+
+_FILENAME_ILLEGAL = r'[/\\:*?<>|]'
+_YEAR_RE = r"(19\d\d|20\d\d)"
+
+
+def _sanitize_name_part(value):
+    """Make a string safe for a Windows filename part.
+
+    '"' is DELETED (illegal in Windows names, no replacement),
+    /\\:*?<>| become spaces, whitespace collapsed, stripped.
+    """
+    value = str(value or "").replace('"', "")
+    value = re.sub(_FILENAME_ILLEGAL, " ", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _build_clip_name(movie_title, clip_title, start_time, video_path):
+    """YouTube-Shorts style output filename (no extension).
+
+    Format: 'Момент из фильма {movie_clean} ({year}), {clip}'.
+    Year is regex-extracted from movie_title and cut out of the clean title;
+    no year part when movie_title has none. Falls back to the timestamp-based
+    '{stem}_{start}' name when clip_title sanitizes to empty.
+    R7b-9: no suffix.
+    """
+    safe_start = start_time.replace(":", "-")
+    clip_clean = _sanitize_name_part(clip_title)
+    if not clip_clean:
+        return f"{Path(video_path).stem}_{safe_start}"
+
+    movie_title = str(movie_title or "").strip()
+    # strip empty parens like "Тор ( )" -> "Тор"
+    movie_title = re.sub(r"\(\s*\)", "", movie_title).strip()
+    movie_title = re.sub(r"\s+", " ", movie_title).strip()
+    match = re.search(r"(19\d\d|20\d\d)", movie_title)
+    if match:
+        year = match.group(1)
+        clean_title = re.sub(r"\s*\(?\s*(19|20)\d\d\s*\)?\s*", " ", movie_title).strip()
+        clean_title = re.sub(r"\(\s*\)", "", clean_title).strip()
+        clean_title = _sanitize_name_part(clean_title)
+        movie_part = f"{clean_title} ({year})" if clean_title else f"({year})"
+    else:
+        clean_title = re.sub(r"\(\s*\)", "", movie_title).strip()
+        movie_part = _sanitize_name_part(clean_title)
+
+    if movie_part:
+        name = f"Момент из фильма {movie_part}, {clip_clean}"
+    else:
+        name = clip_clean
+    return name[:200].strip()
 
 
 def _time_to_seconds(hh_mm_ss: str) -> float:
@@ -49,7 +158,8 @@ def process_clip(video_path, start_time, end_time, options=None, title=""):
             - banner_bottom (int): bottom banner padding (default 300)
             - font_style (dict): subtitle font settings
             - transcript_path (str): path to pre-transcribed JSON
-        title: optional short title to include in output filename
+            - movie_title (str): movie name used in the output filename
+        title: optional short clip title to include in output filename
 
     Returns:
         Path to the final output file, or None on failure.
@@ -63,25 +173,19 @@ def process_clip(video_path, start_time, end_time, options=None, title=""):
     blur_enabled = options.get("blur_background", config.DEFAULT_BLUR_BACKGROUND)
     banner_top = options.get("banner_top", config.DEFAULT_BANNER_TOP)
     banner_bottom = options.get("banner_bottom", config.DEFAULT_BANNER_BOTTOM)
-    font_style = options.get("font_style")
+    font_style = _resolve_font_style(options)
     gpu_opts = _detect_gpu_accel()
 
     video_path = str(video_path)
     os.makedirs(config.TEMP_DIR, exist_ok=True)
     os.makedirs(config.OUTPUT_DIR, exist_ok=True)
 
-    if title:
-        # Sanitize title for filename — preserve Cyrillic
-        safe_title = re.sub(r'[^\w\s\-а-яА-ЯёЁ]', '', title).strip().replace(' ', '_')[:50]
-        clip_name = safe_title
-    else:
-        stem = Path(video_path).stem
-        safe_start = start_time.replace(":", "-")
-        clip_name = f"{stem}_{safe_start}"
+    movie_title = options.get("movie_title", "")
+    clip_name = _build_clip_name(movie_title, title, start_time, video_path)
 
     raw_clip = str(config.TEMP_DIR / f"{clip_name}_raw.mp4")
     clip_with_audio = str(config.TEMP_DIR / f"{clip_name}_audio.mp4")
-    srt_path = str(config.TEMP_DIR / f"{clip_name}.srt")
+    sub_path = str(config.TEMP_DIR / f"{clip_name}.srt")
     vertical_clip = str(config.TEMP_DIR / f"{clip_name}_vert.mp4")
     final_output = str(config.OUTPUT_DIR / f"{clip_name}.mp4")
 
@@ -103,7 +207,7 @@ def process_clip(video_path, start_time, end_time, options=None, title=""):
                 all_segments = load_segments_json(transcript_path)
                 clip_segments = filter_segments_in_range(all_segments, start_sec, end_sec)
                 if clip_segments:
-                    generate_word_group_srt(clip_segments, srt_path)
+                    sub_path = _write_subtitles(clip_segments, str(config.TEMP_DIR / clip_name))
                     print(f"      {len(clip_segments)} segments → word-group SRT")
                 else:
                     print("      No speech in this clip — skipping subtitles")
@@ -120,7 +224,7 @@ def process_clip(video_path, start_time, end_time, options=None, title=""):
                 )
                 segments = transcribe(clip_with_audio)
                 if segments:
-                    generate_word_group_srt(segments, srt_path)
+                    sub_path = _write_subtitles(segments, str(config.TEMP_DIR / clip_name))
                     print(f"      {len(segments)} segments transcribed")
                 else:
                     print("      No speech detected — skipping subtitles")
@@ -150,12 +254,13 @@ def process_clip(video_path, start_time, end_time, options=None, title=""):
             )
 
         # Step 4: Embed subtitles (on content-area video, before banner padding)
-        if subtitles_enabled and os.path.exists(srt_path):
+        if subtitles_enabled and os.path.exists(sub_path) and os.path.getsize(sub_path) > 0:
             print("[4/5] Embedding subtitles...")
             subtitled_clip = str(config.TEMP_DIR / f"{clip_name}_subs.mp4")
-            embed_subtitles(vertical_clip, srt_path, subtitled_clip,
+            embed_subtitles(vertical_clip, sub_path, subtitled_clip,
                            font_style=font_style, banner_top=banner_top,
-                           banner_bottom=banner_bottom, gpu_opts=gpu_opts)
+                           banner_bottom=banner_bottom, gpu_opts=gpu_opts,
+                           fontsdir=os.path.abspath(FONTS_DIR))
         else:
             print("[4/5] Skipping subtitle embed...")
 
@@ -186,7 +291,7 @@ def process_clip(video_path, start_time, end_time, options=None, title=""):
         return None
     finally:
         # Cleanup temp files
-        cleanup_files = [raw_clip, clip_with_audio, srt_path, vertical_clip]
+        cleanup_files = [raw_clip, clip_with_audio, sub_path, vertical_clip]
         if subtitled_clip != vertical_clip:
             cleanup_files.append(subtitled_clip)
         for f in cleanup_files:

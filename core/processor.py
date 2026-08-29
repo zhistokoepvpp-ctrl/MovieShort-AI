@@ -155,7 +155,7 @@ import hashlib
 def _get_person_cache_path(video_path: str) -> Path:
     """Return path to person cache JSON for the given video."""
     h = hashlib.md5(video_path.encode()).hexdigest()[:8]
-    return Path(config.TEMP_DIR) / f"_person_cache_{h}.json"
+    return Path(config.CACHE_DIR) / f"_person_cache_v2_{h}.json"
 
 
 def _load_person_cache(video_path: str):
@@ -197,6 +197,31 @@ _save_face_cache = _save_person_cache
 # ---------------------------------------------------------------------------
 # Video-level face analysis
 # ---------------------------------------------------------------------------
+
+
+def _resolve_cut_flags(corr_values: list[float], cut_strong: float = 0.35,
+                       cut_threshold: float = 0.5) -> list[bool]:
+    """Resolve per-sample cut flags from sequential correlation values
+    with hysteresis: strong cuts fire instantly; candidates need one-sample
+    confirmation against the PRE-candidate frame. Unconfirmed candidates
+    roll prev_hist back to the pre-candidate histogram."""
+    flags = [False] * len(corr_values)
+    i = 0
+    while i < len(corr_values):
+        c = corr_values[i]
+        if c < cut_strong:
+            flags[i] = True  # strong cut: confirmed instantly
+            i += 1
+        elif c < cut_threshold:
+            # Candidate: confirmed only if the NEXT correlation (computed
+            # against the same pre-candidate reference) also drops below the
+            # threshold; the cut then lands on the candidate sample.
+            if i + 1 < len(corr_values) and corr_values[i + 1] < cut_threshold:
+                flags[i] = True
+            i += 2  # confirmation sample is consumed either way
+        else:
+            i += 1
+    return flags
 
 
 def analyze_persons(video_path: str, progress_callback=None) -> list[dict]:
@@ -241,6 +266,23 @@ def analyze_persons(video_path: str, progress_callback=None) -> list[dict]:
 
     # Downscale target: max 360px on the longest side
     _MAX_DETECT_PX = 360
+    # Histogram correlation bands (v1-7 #3b hysteresis): below CUT_STRONG a
+    # cut fires instantly; between CUT_STRONG and CUT_HIST_THRESHOLD it is
+    # only a candidate needing one-sample confirmation.
+    CUT_STRONG = 0.35
+    CUT_HIST_THRESHOLD = 0.5
+
+    # Diagnostics (task v1-7 #3a): MOVIESHORT_DEBUG_CUTS=1 logs per-sample
+    # corr/cut/offset to .omo/evidence/cuts_debug.log — zero effect otherwise.
+    _debug_cuts = os.environ.get("MOVIESHORT_DEBUG_CUTS") == "1"
+    _debug_records: list[tuple] = []
+
+    # Hold protocol (#3b): ref_hist is the last CONFIRMED frame's histogram.
+    # While a candidate is unresolved the reference stays at the pre-candidate
+    # histogram; final cut flags are resolved post-scan by _resolve_cut_flags.
+    ref_hist = None
+    corr_list: list[float] = []
+    _pending_candidate = False
 
     frame_idx = 0
     while True:
@@ -263,6 +305,36 @@ def analyze_persons(video_path: str, progress_callback=None) -> list[dict]:
             small = frame
 
         gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+
+        # Shot-cut detection: grayscale histogram correlation of each sample
+        # against the last CONFIRMED reference frame. Debounce (hysteresis)
+        # is applied post-scan by _resolve_cut_flags; here we only stream
+        # corr values and hold the reference while a candidate is unresolved.
+        hist = cv2.calcHist([gray], [0], None, [64], [0, 256])
+        cv2.normalize(hist, hist)
+        if ref_hist is None:
+            _corr_s = "first"
+            ref_hist = hist
+        else:
+            corr = float(cv2.compareHist(ref_hist, hist, cv2.HISTCMP_CORREL))
+            corr_list.append(corr)
+            _corr_s = f"{corr:.4f}"
+            if _pending_candidate:
+                # Candidate resolves NOW: this corr was computed against the
+                # same pre-candidate reference. Below threshold → cut
+                # confirmed (lands on the candidate sample) and the reference
+                # commits to the confirming frame; otherwise unconfirmed →
+                # reference stays at the pre-candidate histogram.
+                if corr < CUT_HIST_THRESHOLD:
+                    ref_hist = hist
+                _pending_candidate = False
+            elif corr < CUT_STRONG:
+                ref_hist = hist  # strong cut: confirmed instantly
+            elif corr >= CUT_HIST_THRESHOLD:
+                ref_hist = hist  # clear match: advance reference
+            else:
+                _pending_candidate = True  # candidate band: hold reference
+
         detections = []
         num_faces = 0
         num_persons = 0
@@ -353,7 +425,8 @@ def analyze_persons(video_path: str, progress_callback=None) -> list[dict]:
                 "num_faces": num_faces,
                 "num_persons": num_persons,
                 "type": best_det["type"],
-            })
+                "cut": False,  # placeholder — resolved post-scan (#3b)
+        })
         else:
             person_data.append({
                 "frame_idx": frame_idx,
@@ -363,7 +436,18 @@ def analyze_persons(video_path: str, progress_callback=None) -> list[dict]:
                 "num_faces": 0,
                 "num_persons": 0,
                 "type": None,
-            })
+                "cut": False,  # placeholder — resolved post-scan (#3b)
+        })
+
+        if _debug_cuts:
+            fh, fw = frame.shape[:2]
+            if detections:
+                d = max(detections, key=lambda dd: dd["w"] * dd["h"])
+                off_x = int(d["x"] + d["w"] / 2 - fw / 2)
+                off_y = int(d["y"] + d["h"] / 2 - fh / 2)
+            else:
+                off_x = off_y = None
+            _debug_records.append((_corr_s, off_x, off_y))
 
         # User-visible progress
         done = len(person_data)
@@ -385,6 +469,29 @@ def analyze_persons(video_path: str, progress_callback=None) -> list[dict]:
     found = sum(1 for f in person_data if f["x"] is not None)
     print(f"  Person scan complete in {_elapsed:.0f}s, "
           f"found {found}/{len(person_data)} frames with faces/persons")
+
+    # Resolve cut flags with hysteresis (v1-7 #3b anti-jitter debounce):
+    # strong cuts instant, candidates need one-sample confirmation against
+    # the pre-candidate frame. First sample of the scan is always a cut.
+    flags = _resolve_cut_flags(corr_list, cut_threshold=CUT_HIST_THRESHOLD)
+    cut_flags = [True] + flags
+    for rec, cut in zip(person_data, cut_flags):
+        rec["cut"] = cut
+
+    if _debug_cuts and _debug_records:
+        try:
+            log_path = Path(".omo/evidence/cuts_debug.log")
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            lines = [f"{i}\tcorr={c}\tcut={int(cut)}\toff=({ox},{oy})"
+                     for i, ((c, ox, oy), cut)
+                     in enumerate(zip(_debug_records, cut_flags))]
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"=== {video_path} | {time_module.strftime('%Y-%m-%d %H:%M:%S')} "
+                        f"| samples={len(lines)} ===\n")
+                f.write("\n".join(lines) + "\n")
+            print(f"  [debug-cuts] wrote {len(lines)} samples -> {log_path}")
+        except OSError as e:
+            print(f"  [debug-cuts] write failed: {e}")
     _save_person_cache(video_path, person_data)
     return person_data
 
@@ -397,17 +504,23 @@ analyze_faces = analyze_persons
 # Crop-path computation
 # ---------------------------------------------------------------------------
 
+# Adjacent shots whose filled centers are closer than this fraction of the
+# video width are merged into one shot (v1-7 #3b anti-jitter).
+MERGE_DIST_PX_RATIO = 0.06
+
 
 def compute_person_crop_path(
     person_data: list[dict],
     video_width: int,
     video_height: int,
 ) -> list[dict]:
-    """Compute smoothed 9:16 crop rectangles for each analyzed frame.
+    """Compute per-shot 9:16 crop rectangles for each analyzed frame.
 
-    Uses person-centered variance metric (max(x_std, y_std)) for spread,
-    moving-average window of 3 for smoothing.
-    Returns list of ``{frame_idx, crop_x, crop_y, crop_w, crop_h}``.
+    Records are grouped into shots at every ``cut=True`` flag; each shot's
+    crop stays fixed on the median body-center of that shot's largest-area
+    detections. Input without ``cut`` keys (legacy caches/fixtures) forms a
+    single shot. Returns list of
+    ``{frame_idx, shot_id, crop_x, crop_y, crop_w, crop_h}``.
     """
     target_ratio = 9 / 16
     target_w = video_width
@@ -416,71 +529,86 @@ def compute_person_crop_path(
         target_h = video_height
         target_w = int(target_h * target_ratio)
 
-    frames_with_persons = [
-        (i, fd) for i, fd in enumerate(person_data) if fd["x"] is not None
-    ]
+    def _body_center(fd: dict) -> tuple[float, float]:
+        """Body center of the largest detection (same heuristic as analyze_persons)."""
+        if fd.get("center_x") is not None:
+            return (fd["center_x"], fd["center_y"])
+        det_type = fd.get("type") or (
+            "face" if fd.get("num_faces", 0) > 0 else "person"
+        )
+        cy = fd["y"] + fd["h"] * 2 if det_type == "face" else fd["y"] + fd["h"] / 2
+        return (fd["x"] + fd["w"] / 2, cy)
 
-    if not frames_with_persons:
-        cx = video_width / 2
-        cy = video_height / 2
-        return [
-            {
-                "frame_idx": fd["frame_idx"],
-                "crop_x": max(0, int(cx - target_w / 2)),
-                "crop_y": max(0, int(cy - target_h / 2)),
-                "crop_w": min(target_w, video_width),
-                "crop_h": min(target_h, video_height),
-            }
-            for fd in person_data
-        ]
-
-    # Raw centers per frame index — use stored body-centered coordinates
-    raw_centers: dict[int, tuple[float, float]] = {}
-    for idx, fd in frames_with_persons:
-        raw_centers[idx] = (fd["center_x"], fd["center_y"])
-
-    all_indices = [fd["frame_idx"] for fd in person_data]
-    smoothed: dict[int, tuple[float, float]] = {}
-    window = 3
-
-    for fi in all_indices:
-        if fi in raw_centers:
-            # Smooth with neighbouring detections (window=3)
-            neighbors = [
-                raw_centers[j] for j in raw_centers if abs(j - fi) <= window
-            ]
-            avg_x = float(np.mean([n[0] for n in neighbors]))
-            avg_y = float(np.mean([n[1] for n in neighbors]))
-        else:
-            before = [(j, raw_centers[j]) for j in raw_centers if j < fi]
-            after = [(j, raw_centers[j]) for j in raw_centers if j > fi]
-            if before:
-                # Stay at last-known position — don't pull toward future
-                avg_x, avg_y = max(before, key=lambda t: t[0])[1]
-            elif after:
-                # No past detection yet — use first future position
-                avg_x, avg_y = min(after, key=lambda t: t[0])[1]
+    # Split records into shots: a new group starts at every cut=True record.
+    if any("cut" in fd for fd in person_data):
+        shots: list[list[dict]] = []
+        for fd in person_data:
+            if fd.get("cut") or not shots:
+                shots.append([fd])
             else:
-                # No detection at all — center frame (shouldn't happen)
-                avg_x = video_width / 2
-                avg_y = video_height / 2
-        smoothed[fi] = (avg_x, avg_y)
+                shots[-1].append(fd)
+    else:
+        shots = [list(person_data)]  # legacy input: whole clip is one shot
+
+    # Per-shot center: median over that shot's detected frames.
+    centers: list[tuple[float, float] | None] = []
+    for shot in shots:
+        pts = [_body_center(fd) for fd in shot if fd["x"] is not None]
+        centers.append(
+            (float(np.median([p[0] for p in pts])),
+             float(np.median([p[1] for p in pts])))
+            if pts else None
+        )
+
+    # Empty shots inherit previous shot's center, else next, else frame center.
+    filled: list[tuple[float, float]] = []
+    for i, c in enumerate(centers):
+        if c is None:
+            prev_c = next((centers[j] for j in range(i - 1, -1, -1)
+                           if centers[j] is not None), None)
+            next_c = next((centers[j] for j in range(i + 1, len(centers))
+                           if centers[j] is not None), None)
+            c = prev_c or next_c or (video_width / 2, video_height / 2)
+        filled.append(c)
+
+    # Merge adjacent shots whose filled centers are closer than MERGE_DIST_PX
+    # (#3b): detection flicker splits one continuous shot into micro-shots,
+    # each pulling the camera sideways. Merged shots recompute the median
+    # over the union of their detected frames.
+    merge_dist = int(MERGE_DIST_PX_RATIO * video_width)
+    groups: list[list[dict]] = []
+    group_centers: list[tuple[float, float]] = []
+    for shot, c in zip(shots, filled):
+        if group_centers:
+            px, py = group_centers[-1]
+            if ((px - c[0]) ** 2 + (py - c[1]) ** 2) ** 0.5 < merge_dist:
+                groups[-1].extend(shot)
+                pts = [_body_center(fd) for fd in groups[-1]
+                       if fd["x"] is not None]
+                if pts:
+                    group_centers[-1] = (
+                        float(np.median([p[0] for p in pts])),
+                        float(np.median([p[1] for p in pts])))
+                continue
+        groups.append(list(shot))
+        group_centers.append(c)
 
     result = []
-    for fd in person_data:
-        fi = fd["frame_idx"]
-        cx, cy = smoothed.get(fi, (video_width / 2, video_height / 2))
+    for shot_id, shot in enumerate(groups):
+        cx, cy = group_centers[shot_id]
         crop_x = int(cx - target_w / 2)
         crop_y = int(cy - target_h / 2)
         crop_x = max(0, min(crop_x, video_width - target_w))
         crop_y = max(0, min(crop_y, video_height - target_h))
-        result.append({
-            "frame_idx": fi,
-            "crop_x": crop_x,
-            "crop_y": crop_y,
-            "crop_w": target_w,
-            "crop_h": target_h,
-        })
+        for fd in shot:
+            result.append({
+                "frame_idx": fd["frame_idx"],
+                "shot_id": shot_id,
+                "crop_x": crop_x,
+                "crop_y": crop_y,
+                "crop_w": target_w,
+                "crop_h": target_h,
+            })
     return result
 
 
@@ -566,20 +694,84 @@ def _center_crop_ffmpeg_fixed(video_path, output_path, target_w, content_h,
         raise subprocess.CalledProcessError(_proc.returncode, _proc.args)
 
 
+# Max piecewise segments in one ffmpeg crop expression before forced merging
+MAX_CROP_SEGMENTS = 60
+
+
+def _crop_segments_from_path(crop_path, fps, video_size, target_size):
+    """Per-shot crop offsets [(t_start_sec, offset_x, offset_y)].
+
+    One segment per shot_id change in crop_path; offsets scaled/clamped to
+    the FFmpeg scale filter; adjacent duplicates merged; count capped at
+    MAX_CROP_SEGMENTS by collapsing shortest-duration adjacent pairs.
+    """
+    video_w, video_h = video_size
+    target_w, content_h = target_size
+    if video_w > 0 and video_h > 0:
+        sf = max(target_w / video_w, content_h / video_h)
+    else:
+        sf = 1.0
+    max_x = int(video_w * sf - target_w)
+    max_y = int(video_h * sf - content_h)
+
+    segments = []
+    prev_shot = object()
+    for entry in crop_path:
+        shot = entry.get("shot_id")
+        if shot == prev_shot:
+            continue
+        ox = max(0, min(int(entry["crop_x"] * sf), max_x))
+        oy = max(0, min(int(entry["crop_y"] * sf), max_y))
+        segments.append((entry["frame_idx"] / fps, ox, oy))
+        prev_shot = shot
+
+    # Merge adjacent segments with identical offsets
+    merged = []
+    for seg in segments:
+        if merged and merged[-1][1] == seg[1] and merged[-1][2] == seg[2]:
+            continue
+        merged.append(seg)
+    # ponytail: cap keeps the earlier pair member's offsets; fidelity is fine at <=60
+    while len(merged) > MAX_CROP_SEGMENTS:
+        shortest = min(range(len(merged) - 1),
+                       key=lambda i: merged[i + 1][0] - merged[i][0])
+        del merged[shortest + 1]
+    return merged
+
+
+def _build_crop_expression(segments):
+    """Filter-ready piecewise-constant ffmpeg x(t)/y(t) expressions.
+
+    x(t) = if(lt(t,t1),x0,if(lt(t,t2),x1,...,xn)); a single segment yields
+    plain constants without lt(). Commas are backslash-escaped so the
+    filtergraph parser does not split the expression into fake filters.
+    """
+    if len(segments) == 1:
+        return str(segments[0][1]), str(segments[0][2])
+    x_expr = str(segments[-1][1])
+    y_expr = str(segments[-1][2])
+    for t_start, x, y in reversed(segments[:-1]):
+        x_expr = f"if(lt(t,{t_start}),{x},{x_expr})"
+        y_expr = f"if(lt(t,{t_start}),{y},{y_expr})"
+    # Escape commas for the ffmpeg filtergraph parser (", " splits filters)
+    return x_expr.replace(",", "\\,"), y_expr.replace(",", "\\,")
+
+
 def _face_tracking_crop(video_path, output_path, crop_path, fps,
                          anti_copyright=True, ac_part="", target_w=1080,
                          content_h=1320, progress_callback=None,
                          clip_duration=0):
-    """Apply face-tracking crop using a single stable crop rectangle.
+    """Apply face-tracking crop as piecewise-constant per-shot offsets.
 
-    Computes the median crop position (smoothed by compute_person_crop_path),
-    scales coordinates to match the FFmpeg scale filter, and runs one
-    FFmpeg command (no segment splitting — avoids ultra-short segment
-    crashes and concat complexity).
+    Builds one segment per shot_id change in crop_path, scales each offset
+    to match the FFmpeg scale filter, merges neighbors with identical
+    offsets, and renders everything in ONE FFmpeg pass via time expressions
+    x(t)/y(t) — the crop jumps instantly at shot cuts (no panning, no
+    segment splitting, no concat).
 
     The filter chain:
       scale=W:H:force_original_aspect_ratio=increase  → fills content area
-      crop=W:H:offset_x:0                             → shifts to follow face
+      crop=W:H:x(t):y(t)                              → follows active shot
       [anti-copyright filters]
     """
     if not crop_path:
@@ -591,49 +783,14 @@ def _face_tracking_crop(video_path, output_path, crop_path, fps,
     video_w = _get_video_width(video_path)
     video_h = _get_video_height(video_path)
 
-    # Check variance — if high, use segment-based dynamic cropping
-    crop_x_list = [entry["crop_x"] for entry in crop_path]
-    crop_y_list = [entry["crop_y"] for entry in crop_path]
-    x_std = float(np.std(crop_x_list)) if len(crop_x_list) > 1 else 0
-    y_std = float(np.std(crop_y_list)) if len(crop_y_list) > 1 else 0
-    max_std = max(x_std, y_std)
-
-    # Dynamic crop threshold: 50px std deviation triggers segment-based approach
-    DYNAMIC_CROP_THRESHOLD = 50.0
-
-    if max_std > DYNAMIC_CROP_THRESHOLD:
-        print(f"  High movement variance (std={max_std:.0f}px) — using segment-based dynamic crop")
-        _segment_based_crop(video_path, output_path, crop_path, fps,
-                           anti_copyright=anti_copyright, ac_part=ac_part,
-                           target_w=target_w, content_h=content_h,
-                           progress_callback=progress_callback,
-                           clip_duration=clip_duration)
-        return
-
-    # Median crop position in original video coordinates
-    crop_x_orig = int(np.median(crop_x_list))
-    crop_y_orig = int(np.median(crop_y_list))
-
-    # Scale factor for: scale=target_w:content_h:force_original_aspect_ratio=increase
-    if video_w > 0 and video_h > 0:
-        sf = max(target_w / video_w, content_h / video_h)
-    else:
-        sf = 1.0
-
-    scaled_w = video_w * sf
-    scaled_h = video_h * sf
-
-    # Crop window start position in scaled coordinates
-    offset_x = crop_x_orig * sf
-    offset_y = crop_y_orig * sf
-
-    # Clamp to valid range so the crop window stays within the scaled frame
-    offset_x = max(0, min(int(offset_x), int(scaled_w - target_w)))
-    offset_y = max(0, min(int(offset_y), int(scaled_h - content_h)))
+    segments = _crop_segments_from_path(crop_path, fps,
+                                        (video_w, video_h),
+                                        (target_w, content_h))
+    x_expr, y_expr = _build_crop_expression(segments)
 
     filter_str = (
         f"scale={target_w}:{content_h}:force_original_aspect_ratio=increase,"
-        f"crop={target_w}:{content_h}:{offset_x}:{offset_y}"
+        f"crop={target_w}:{content_h}:{x_expr}:{y_expr}"
         f"{ac_part}"
     )
 
@@ -664,142 +821,6 @@ def _face_tracking_crop(video_path, output_path, crop_path, fps,
     _proc.wait()
     if _proc.returncode != 0:
         raise subprocess.CalledProcessError(_proc.returncode, _proc.args)
-
-
-def _segment_based_crop(video_path, output_path, crop_path, fps,
-                        anti_copyright=True, ac_part="", target_w=1080,
-                        content_h=1320, progress_callback=None,
-                        clip_duration=0):
-    """Apply segment-based dynamic cropping for high-variance movement.
-
-    Splits the clip into ~10s segments, each with its own crop position.
-    Uses concat filter (not demuxer) to avoid AAC encoder delay issues.
-    Input seeking (-ss before -i) for segment extraction.
-    """
-    import re as _re
-    import tempfile
-
-    video_w = _get_video_width(video_path)
-    video_h = _get_video_height(video_path)
-
-    # Segment duration in seconds
-    SEGMENT_DURATION = 10.0
-    total_frames = len(crop_path)
-    frames_per_segment = int(SEGMENT_DURATION * fps)
-
-    # Build segments
-    segments = []
-    seg_start = 0
-    while seg_start < total_frames:
-        seg_end = min(seg_start + frames_per_segment, total_frames)
-        seg_frames = crop_path[seg_start:seg_end]
-
-        # Median crop for this segment
-        crop_x = int(np.median([e["crop_x"] for e in seg_frames]))
-        crop_y = int(np.median([e["crop_y"] for e in seg_frames]))
-
-        # Time bounds for this segment
-        start_time_sec = seg_frames[0]["frame_idx"] / fps
-        end_time_sec = seg_frames[-1]["frame_idx"] / fps + (1.0 / fps)
-
-        segments.append({
-            "start_sec": start_time_sec,
-            "end_sec": end_time_sec,
-            "crop_x": crop_x,
-            "crop_y": crop_y,
-        })
-        seg_start = seg_end
-
-    if not segments:
-        _center_crop_ffmpeg_fixed(video_path, output_path, target_w, content_h,
-                                   ac_part, progress_callback, clip_duration)
-        return
-
-    # Scale factor
-    if video_w > 0 and video_h > 0:
-        sf = max(target_w / video_w, content_h / video_h)
-    else:
-        sf = 1.0
-
-    # Generate segment files
-    tmp_dir = Path(tempfile.mkdtemp(prefix="ms_crop_"))
-    segment_files = []
-    concat_list_path = tmp_dir / "concat.txt"
-
-    try:
-        for i, seg in enumerate(segments):
-            seg_file = tmp_dir / f"seg_{i:03d}.mp4"
-            segment_files.append(seg_file)
-
-            # Scale coordinates
-            offset_x = max(0, min(int(seg["crop_x"] * sf), int(video_w * sf - target_w)))
-            offset_y = max(0, min(int(seg["crop_y"] * sf), int(video_h * sf - content_h)))
-
-            filter_str = (
-                f"scale={target_w}:{content_h}:force_original_aspect_ratio=increase,"
-                f"crop={target_w}:{content_h}:{offset_x}:{offset_y}"
-                f"{ac_part}"
-            )
-
-            # Input seeking for each segment
-            start_h = int(seg["start_sec"] // 3600)
-            start_m = int((seg["start_sec"] % 3600) // 60)
-            start_s = seg["start_sec"] % 60
-            end_h = int(seg["end_sec"] // 3600)
-            end_m = int((seg["end_sec"] % 3600) // 60)
-            end_s = seg["end_sec"] % 60
-
-            cmd = [
-                "ffmpeg", "-y",
-                "-ss", f"{start_h:02d}:{start_m:02d}:{start_s:06.3f}",
-                "-to", f"{end_h:02d}:{end_m:02d}:{end_s:06.3f}",
-                "-i", video_path,
-                "-vf", filter_str,
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-                "-c:a", "aac",
-                str(seg_file),
-            ]
-            _run(cmd, desc=f"segment_{i}")
-
-        # Write concat list
-        with open(concat_list_path, "w") as f:
-            for seg_file in segment_files:
-                f.write(f"file '{seg_file}'\n")
-
-        # Concat using filter (not demuxer — avoids AAC encoder delay)
-        _time_re = _re.compile(r"time=(\d+):(\d+):(\d+\.\d+)")
-        _proc = subprocess.Popen(
-            [
-                "ffmpeg", "-y",
-                "-f", "concat", "-safe", "0",
-                "-i", str(concat_list_path),
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-                "-c:a", "aac",
-                output_path,
-            ],
-            stderr=subprocess.PIPE,
-            universal_newlines=True,
-        )
-        assert _proc.stderr is not None
-        for line in _proc.stderr:
-            m = _time_re.search(line)
-            if m and clip_duration > 0:
-                h, mnt, s = int(m.group(1)), int(m.group(2)), float(m.group(3))
-                elapsed = h * 3600 + mnt * 60 + s
-                pct = min(0.99, 0.6 + 0.39 * (elapsed / clip_duration))
-                if progress_callback:
-                    progress_callback(pct)
-        _proc.wait()
-        if _proc.returncode != 0:
-            raise subprocess.CalledProcessError(_proc.returncode, _proc.args)
-
-    finally:
-        # Cleanup temp files
-        import shutil
-        try:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-        except Exception:
-            pass
 
 
 def _get_clip_duration(video_path: str) -> float:

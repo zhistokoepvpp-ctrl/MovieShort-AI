@@ -114,7 +114,7 @@ def _get_audio_rms(video_path, audio_path, language=None, model=None):
 
     hash_input = f"{video_path}_{language}_{model}"
     file_hash = hashlib.md5(hash_input.encode()).hexdigest()[:8]
-    cache_file = os.path.join(str(config.TEMP_DIR), f"_audio_rms_{file_hash}.json")
+    cache_file = os.path.join(str(config.CACHE_DIR), f"_audio_rms_{file_hash}.json")
 
     if os.path.exists(cache_file):
         try:
@@ -126,7 +126,7 @@ def _get_audio_rms(video_path, audio_path, language=None, model=None):
     rms = _compute_audio_rms(video_path, audio_path)
 
     try:
-        os.makedirs(config.TEMP_DIR, exist_ok=True)
+        os.makedirs(config.CACHE_DIR, exist_ok=True)
         with open(cache_file, "w") as f:
             _json.dump(rms, f)
     except Exception:
@@ -437,9 +437,10 @@ def get_scene_transcripts(video_path, scenes, language=None):
     hash_input = f"{video_path}_{language}_{config.WHISPER_MODEL}"
     file_hash = hashlib.md5(hash_input.encode()).hexdigest()[:8]
     transcript_json = os.path.join(
-        str(config.TEMP_DIR),
+        str(config.CACHE_DIR),
         f"full_transcript_{video_basename}_{file_hash}.json"
     )
+    os.makedirs(config.CACHE_DIR, exist_ok=True)
     save_segments_json(all_segments, transcript_json)
 
     PAUSE_GAP = config.DIALOGUE_PAUSE_THRESHOLD
