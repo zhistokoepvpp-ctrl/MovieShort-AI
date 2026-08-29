@@ -117,8 +117,6 @@ If you find this project useful, you can support it:
 8. **Clip selection** — Score ≥ 7, diversity filter spreads clips across movie, deduplication (min gap 120s), short clip expansion.
 9. **FFmpeg processing** — Cut → 9:16 crop → subtitles → blurred background → 1080×1920
 
-> v1.5.0 cost: ~65 RUB per 102min film (24 LLM calls instead of 474).
-
 ### License
 
 [MIT](LICENSE) — free to use, modify, and distribute.
@@ -220,8 +218,6 @@ run.bat
 7. **Валидация + fallback** — Поблочная проверка (длительность 20-75с, оценка 1-10, в границах блока). Если LLM не дала клипов для блока, но есть диалог → `_find_best_window()` (smart centering).
 8. **Выбор клипов** — Оценка ≥ 7, diversity-фильтр распределяет по фильму, дедупликация (мин. 120с), расширение коротких клипов.
 9. **FFmpeg обработка** — Нарезка → кроп 9:16 → субтитры → размытый фон → 1080×1920
-
-> v1.5.0 стоимость: ~65₽ за фильм 102 мин (24 вызова LLM вместо 474).
 
 ### Структура проекта
 
