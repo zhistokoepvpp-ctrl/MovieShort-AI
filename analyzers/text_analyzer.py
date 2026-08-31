@@ -884,22 +884,107 @@ def _parse_batch_response(raw: str, block_start_times: list[float]) -> dict[int,
     Returns:
         dict mapping block_index -> list of clip dicts (with absolute timestamps)
     """
-    if not raw:
+    if not raw or not isinstance(raw, str):
+        return {}
+    content = raw.strip()
+    if not content:
         return {}
 
+    # 1) extract from ```json fence if present, else use raw content
+    fence_match = re.search(r'```(?:json)?\s*(\[.*?\])\s*```', content, re.DOTALL)
+    json_text = fence_match.group(1) if fence_match else content
+
+    # 2) try json.loads on extracted text
     try:
-        clips = json.loads(raw)
+        clips = json.loads(json_text)
+        if isinstance(clips, list):
+            result: dict[int, list[dict]] = {}
+            for item in clips:
+                if not isinstance(item, dict):
+                    continue
+                block_raw = item.get("block")
+                try:
+                    block_idx = int(block_raw) if isinstance(block_raw, str) else block_raw
+                except (ValueError, TypeError):
+                    continue
+                if not isinstance(block_idx, int):
+                    continue
+                if block_idx < 0 or block_idx >= len(block_start_times):
+                    continue
+                result.setdefault(block_idx, []).append(item)
+            return result
+        # if not list, fall through to regex fallback
     except (json.JSONDecodeError, TypeError):
-        clips = []
+        pass
 
-    if not isinstance(clips, list):
-        return {}
+    # also try extracting array substring from json_text if direct loads failed
+    arr_match = re.search(r'\[.*\]', json_text, re.DOTALL)
+    if arr_match:
+        try:
+            clips2 = json.loads(arr_match.group(0))
+            if isinstance(clips2, list):
+                result: dict[int, list[dict]] = {}
+                for item in clips2:
+                    if not isinstance(item, dict):
+                        continue
+                    block_raw = item.get("block")
+                    try:
+                        block_idx = int(block_raw) if isinstance(block_raw, str) else block_raw
+                    except (ValueError, TypeError):
+                        continue
+                    if not isinstance(block_idx, int):
+                        continue
+                    if block_idx < 0 or block_idx >= len(block_start_times):
+                        continue
+                    result.setdefault(block_idx, []).append(item)
+                return result
+        except (json.JSONDecodeError, TypeError):
+            pass
 
+    # 3) regex fallback for truncated / malformed JSON — collect objects with "block"
     result: dict[int, list[dict]] = {}
-    for item in clips:
+    for m in re.finditer(r'\{[^{}]*"block"[^{}]*\}', content):
+        obj_text = m.group(0)
+        try:
+            item = json.loads(obj_text)
+        except (json.JSONDecodeError, TypeError):
+            # try manual field extraction for block str/int
+            bm = re.search(r'"block"\s*:\s*"?(\d+)"?', obj_text)
+            if not bm:
+                continue
+            try:
+                item = {"block": int(bm.group(1))}
+                # also try to extract start/end/title/score if present for completeness
+                sm = re.search(r'"start"\s*:\s*([\d.]+)', obj_text)
+                em = re.search(r'"end"\s*:\s*([\d.]+)', obj_text)
+                if sm:
+                    try:
+                        item["start"] = float(sm.group(1))
+                    except ValueError:
+                        pass
+                if em:
+                    try:
+                        item["end"] = float(em.group(1))
+                    except ValueError:
+                        pass
+                tm = re.search(r'"title"\s*:\s*"([^"]*)"', obj_text)
+                if tm:
+                    item["title"] = tm.group(1)
+                sc = re.search(r'"score"\s*:\s*([\d.]+)', obj_text)
+                if sc:
+                    try:
+                        item["score"] = float(sc.group(1))
+                    except ValueError:
+                        pass
+            except (ValueError, TypeError):
+                continue
         if not isinstance(item, dict):
             continue
-        block_idx = item.get("block")
+        block_raw = item.get("block")
+        try:
+            block_idx = int(block_raw) if isinstance(block_raw, str) else block_raw
+        except (ValueError, TypeError):
+            continue
         if not isinstance(block_idx, int):
             continue
         if block_idx < 0 or block_idx >= len(block_start_times):
@@ -1042,7 +1127,7 @@ def ask_llm_context_mode(
                 print(f" OK ({len(parsed)} rated)")
                 all_results.extend(parsed)
             else:
-                print(f" OK (0 rated — fallback to score 5)")
+                print(" OK (0 rated — fallback to score 5)")
                 for i in range(len(batch)):
                     all_results.append({
                         "scene_num": start_idx + i + 1,

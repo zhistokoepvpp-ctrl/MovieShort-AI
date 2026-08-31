@@ -1168,7 +1168,75 @@ box-shadow:0 4px 15px rgba(193,95,60,0.4);
         return ""
 
 
+# --- Gradio Temp cleanup (T14) ---
+def _is_gradio_temp_path(p: str) -> bool:
+    """True if path is inside system Temp/gradio."""
+    try:
+        import tempfile
+        gradio_tmp = os.path.join(tempfile.gettempdir(), "gradio").lower()
+        pl = p.lower()
+        if gradio_tmp in pl:
+            return True
+        # separator-aware fallback: must have /gradio/ segment
+        if os.path.sep + "gradio" + os.path.sep in pl:
+            return True
+        if pl.endswith(os.path.sep + "gradio"):
+            return True
+        # also handle Temp+gradio combo safety
+        if (os.path.sep + "temp" + os.path.sep in pl) and (os.path.sep + "gradio" + os.path.sep in pl):
+            return True
+        return False
+    except Exception:
+        return "gradio" in p.lower()
+
+
+def _try_remove_gradio_temp(p: str) -> None:
+    """Remove Gradio temp file if it matches Temp/gradio pattern."""
+    try:
+        if p and _is_gradio_temp_path(p) and os.path.isfile(p):
+            import os as _os2  # noqa: F811
+            _os2.unlink(p)
+            print(f"  \U0001f9f9 Gradio temp {os.path.basename(p)} удалён")
+    except Exception:
+        pass
+
+
+def cleanup_gradio_temp(max_age_seconds: int = 86400) -> int:
+    """Стартап-чистка Temp/gradio старше max_age_seconds. Returns removed count."""
+    try:
+        import tempfile
+        import time
+        import shutil
+
+        gradio_tmp = os.path.join(tempfile.gettempdir(), "gradio")
+        if not os.path.isdir(gradio_tmp):
+            return 0
+        now = time.time()
+        removed = 0
+        for f in os.listdir(gradio_tmp):
+            fp = os.path.join(gradio_tmp, f)
+            try:
+                if now - os.path.getmtime(fp) > max_age_seconds:
+                    if os.path.isdir(fp):
+                        shutil.rmtree(fp)
+                    else:
+                        os.unlink(fp)
+                    removed += 1
+            except Exception:
+                pass
+        if removed:
+            print(f"\U0001f9f9 Gradio temp: удалено {removed} старых файлов")
+        return removed
+    except Exception:
+        return 0
+
+
 def create_app() -> gr.Blocks:
+    # стартап-чистка Gradio temp
+    try:
+        cleanup_gradio_temp()
+    except Exception:
+        pass
     # Load persisted settings
     cfg = user_config.load()
     # Actual cost per minute from billing data: 31 руб / 246 мин = 0.13 руб/мин
@@ -1392,6 +1460,22 @@ def create_app() -> gr.Blocks:
                     new_lines = capture.get_new_lines()
                     if new_lines:
                         all_lines.extend(new_lines)
+
+                    # T14: автоочистка Gradio temp после обработки
+                    try:
+                        if file and hasattr(file, 'name'):
+                            p = str(file.name)
+                            if os.path.sep + "Temp" + os.path.sep in p or "gradio" in p.lower():
+                                import os as _os2
+                                _os2.unlink(p)
+                                print(f"  \U0001f9f9 Gradio temp {os.path.basename(p)} удалён")
+                    except Exception:
+                        pass
+                    # fallback via helper (covers edge where p already in video_path)
+                    try:
+                        _try_remove_gradio_temp(video_path)
+                    except Exception:
+                        pass
 
                     if error_container:
                         print(f"\nОШИБКА: {error_container[0]}")
@@ -1686,6 +1770,20 @@ def create_app() -> gr.Blocks:
                         new_lines = capture.get_new_lines()
                         if new_lines:
                             all_lines.extend(new_lines)
+
+                        # T14: автоочистка Gradio temp для пакетного режима
+                        try:
+                            p = str(video_path)
+                            if os.path.sep + "Temp" + os.path.sep in p or "gradio" in p.lower():
+                                import os as _os2
+                                _os2.unlink(p)
+                                print(f"  \U0001f9f9 Gradio temp {os.path.basename(p)} удалён")
+                        except Exception:
+                            pass
+                        try:
+                            _try_remove_gradio_temp(video_path)
+                        except Exception:
+                            pass
 
                         if results_container:
                             all_results.extend(results_container[0])

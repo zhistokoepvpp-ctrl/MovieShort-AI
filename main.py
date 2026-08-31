@@ -23,8 +23,50 @@ import config
 from gui.app import create_app
 
 
+def cleanup_gradio_temp_startup():
+    """Стартап-чистка Temp/gradio старше 24ч (T14)."""
+    try:
+        import tempfile
+        import os
+        import time
+        import shutil
+
+        gradio_tmp = os.path.join(tempfile.gettempdir(), "gradio")
+        if os.path.isdir(gradio_tmp):
+            now = time.time()
+            removed = 0
+            for f in os.listdir(gradio_tmp):
+                fp = os.path.join(gradio_tmp, f)
+                try:
+                    if now - os.path.getmtime(fp) > 86400:
+                        if os.path.isdir(fp):
+                            shutil.rmtree(fp)
+                        else:
+                            os.unlink(fp)
+                        removed += 1
+                except Exception:
+                    pass
+            if removed:
+                print(f"\U0001f9f9 Gradio temp: удалено {removed} старых файлов")
+            return removed
+    except Exception:
+        pass
+    return 0
+
+
 def main():
     """Launch the MovieShort AI Gradio interface."""
+    # T14 стартап-чистка
+    try:
+        cleanup_gradio_temp_startup()
+    except Exception:
+        pass
+    # также пробуем вызвать из gui.app если там есть
+    try:
+        from gui.app import cleanup_gradio_temp as _gui_cleanup
+        _gui_cleanup()
+    except Exception:
+        pass
     print(f"[MovieShort AI] starting on http://localhost:{config.GRADIO_PORT}")
     print(f"   Output directory: {config.OUTPUT_DIR}")
     print(f"   Language: Russian / English (select in Auto mode -> Film language)")

@@ -77,7 +77,7 @@ If you find this project useful, you can support it:
 
 | Mode | Description |
 |------|-------------|
-| **Contextual (LLM)** | Default. Block-based pipeline: scenes merged into ~120s super-blocks with dialogue, cut count, RMS envelope. LLM batches by 2 blocks, returns clips with absolute timestamps. Validation + smart centering fallback. |
+| **Contextual (LLM)** | Default. Block-based pipeline: scenes merged into ~120s super-blocks with dialogue, cut count, RMS envelope. LLM batches by 4 for 1M models (deepseek-v4-flash, nemotron-3-ultra-free), 3 for 190-262K (big-pickle, mimo-v2.5-free, hy3-free, nemotron-3.5-lightning-free), 2 default blocks, returns clips with absolute timestamps. Validation + smart centering fallback. |
 | **Standard (no LLM)** | Random scene selection. No API key required. No clip names generated. |
 | **Manual** | Enter custom timestamps — clips are cut exactly at those points. |
 
@@ -112,7 +112,7 @@ If you find this project useful, you can support it:
 3. **Transcription** — faster-whisper (medium) once for the full movie
 4. **Block assembly** — Scenes carry metadata: dialogue pauses, cut count (action proxy), audio RMS envelope. Adjacent blocks are merged into ~120s super-blocks.
 5. **Silent block filter** — Blocks without dialogue are excluded entirely (no clips from silent scenes).
-6. **Batch LLM processing** — Super-blocks are grouped in batches of 2. A single prompt `PROMPT_BATCH_TO_CLIPS` lists both blocks with full dialogue, cut count, and pauses. LLM returns JSON with absolute timestamps and per-block indices.
+6. **Batch LLM processing** — Super-blocks are grouped in batches of 4 for 1M models (deepseek-v4-flash, nemotron-3-ultra-free), 3 for 190-262K (big-pickle, mimo-v2.5-free, hy3-free, nemotron-3.5-lightning-free), 2 default. A single prompt `PROMPT_BATCH_TO_CLIPS` lists blocks with full dialogue, cut count, and pauses. LLM returns JSON with absolute timestamps and per-block indices.
 7. **Validation + fallback** — Per-block validation (duration 20-75s, score 1-10, within block bounds). If LLM returns no clips for a block but dialogue exists → `_find_best_window()` (smart centering).
 8. **Clip selection** — Score ≥ 7, diversity filter spreads clips across movie, deduplication (min gap 120s), short clip expansion.
 9. **FFmpeg processing** — Cut → 9:16 crop → subtitles → blurred background → 1080×1920
@@ -179,7 +179,7 @@ run.bat
 
 | Режим | Описание |
 |-------|----------|
-| **Контекстный (LLM)** | По умолчанию. Block-based pipeline: сцены сливаются в супер-блоки ~120с с диалогом, сменами кадра, RMS. LLM батчами по 2 блока, возвращает клипы с абсолютными таймстемпами. Валидация + smart centering fallback. |
+| **Контекстный (LLM)** | По умолчанию. Block-based pipeline: сцены сливаются в супер-блоки ~120с с диалогом, сменами кадра, RMS. LLM батчами по 4 для 1M-моделей (deepseek, nemotron), по 3 для 190-262K, по 2 по умолчанию, возвращает клипы с абсолютными таймстемпами. Валидация + smart centering fallback. |
 | **Стандартный (без LLM)** | Случайный выбор сцен. Не требует API-ключа. Названия не генерируются. |
 | **Ручной** | Укажи таймкоды — программа нарежет клипы по ним. |
 
@@ -214,7 +214,7 @@ run.bat
 3. **Транскрипция** — faster-whisper (medium) распознаёт речь 1 раз для всего фильма
 4. **Сборка блоков** — Сцены получают метаданные: паузы в диалоге, количество смен кадра (косвенный показатель экшна), RMS-огибающая аудио. Соседние блоки сливаются в супер-блоки ~120с.
 5. **Фильтр тихих блоков** — Блоки без диалога полностью исключаются (клипы из них не делаются).
-6. **Батч LLM** — Супер-блоки группируются по 2. Один промпт `PROMPT_BATCH_TO_CLIPS` содержит оба блока с полным диалогом, сменами кадра и паузами. LLM возвращает JSON с абсолютными таймстемпами и индексами блоков.
+6. **Батч LLM** — Супер-блоки группируются батчами по 4 для 1M-моделей (deepseek, nemotron), по 3 для 190-262K, по 2 по умолчанию. Один промпт `PROMPT_BATCH_TO_CLIPS` содержит блоки с полным диалогом, сменами кадра и паузами. LLM возвращает JSON с абсолютными таймстемпами и индексами блоков.
 7. **Валидация + fallback** — Поблочная проверка (длительность 20-75с, оценка 1-10, в границах блока). Если LLM не дала клипов для блока, но есть диалог → `_find_best_window()` (smart centering).
 8. **Выбор клипов** — Оценка ≥ 7, diversity-фильтр распределяет по фильму, дедупликация (мин. 120с), расширение коротких клипов.
 9. **FFmpeg обработка** — Нарезка → кроп 9:16 → субтитры → размытый фон → 1080×1920

@@ -4,7 +4,7 @@ MovieShort AI — Configuration
 from pathlib import Path
 
 # App version
-APP_VERSION = "2.0"
+APP_VERSION = "2.1"
 
 # Paths
 BASE_DIR = Path(__file__).parent
@@ -94,10 +94,10 @@ YANDEX_MODEL_LIST = [
 ]
 YANDEX_BASE_URL = "https://ai.api.cloud.yandex.net/v1"
 
-# LLM batching by model context (task: fewer paid calls for long-context models)
-MODEL_BATCH_SIZES = {"deepseek-v4-flash": 8}
+# LLM batching by model context (4 for 1M, 3 for 190-262K, 2 default) — fewer paid calls for long-context models
+MODEL_BATCH_SIZES = {"deepseek-v4-flash": 4, "nemotron-3-ultra-free": 4, "big-pickle": 3, "mimo-v2.5-free": 3, "hy3-free": 3, "nemotron-3.5-lightning-free": 3}
 DEFAULT_LLM_BATCH_SIZE = 2
-MODEL_CONTEXT_TOKENS = {"deepseek-v4-flash": 1000000}
+MODEL_CONTEXT_TOKENS = {"deepseek-v4-flash": 1000000, "nemotron-3-ultra-free": 1000000, "big-pickle": 200000, "mimo-v2.5-free": 200000, "hy3-free": 190000, "nemotron-3.5-lightning-free": 262000}
 DEFAULT_CONTEXT_TOKENS = 32000
 PROMPT_CHARS_PER_TOKEN = 2.5     # оценка для русскоязычного диалога
 PROMPT_INPUT_BUDGET = 0.5        # половина контекста на вход (остаток: выход 4096 + оверхед)

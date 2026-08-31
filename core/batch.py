@@ -2,7 +2,6 @@
 MovieShort AI — Batch processor.
 Processes a full movie: auto-detect best scenes → process each into a Short.
 """
-import json
 import os
 import re
 import shutil
@@ -11,7 +10,7 @@ from pathlib import Path
 import config
 from analyzers.detector import find_best_clips_standard
 from analyzers.text_analyzer import call_llm
-from core.pipeline import process_clip, process_multiple
+from core.pipeline import process_multiple
 from core.subtitle import load_segments_json
 from utils import get_video_basename
 
@@ -102,7 +101,7 @@ def process_movie(video_path, settings=None):
     # Context mode: LLM sees real scene transcripts, picks by number
     if analysis_mode == "context" and movie_title and api_key:
         print(f"  Режим: контекстный ({llm_provider})")
-        print(f"  → Context mode: LLM видит текст сцен, выбирает по номерам")
+        print("  → Context mode: LLM видит текст сцен, выбирает по номерам")
         best_scenes = find_best_clips_context(
             video_path, movie_title, api_key, llm_provider,
             max_duration, min_duration,
@@ -115,8 +114,8 @@ def process_movie(video_path, settings=None):
 
     # Standard mode: NO LLM, random selection
     if best_scenes is None:
-        print(f"  Режим: стандартный")
-        print(f"  → Standard mode: без LLM, названия не генерируются")
+        print("  Режим: стандартный")
+        print("  → Standard mode: без LLM, названия не генерируются")
         best_scenes = find_best_clips_standard(
             video_path,
             max_duration=max_duration,
@@ -267,7 +266,7 @@ def cleanup_temp_dir():
                     shutil.rmtree(fp)
             except Exception:
                 pass
-        print(f"  🧹 Временные файлы удалены")
+        print("  🧹 Временные файлы удалены")
 
 
 def _format_time(seconds):
@@ -477,7 +476,8 @@ def _batch_size_for_model(model):
 
 def _max_prompt_chars(model):
     """Prompt char budget: context tokens * chars/token estimate * input share."""
-    ctx = config.MODEL_CONTEXT_TOKENS.get(model, config.DEFAULT_CONTEXT_TOKENS)
+    merged = {**config.MODEL_CONTEXT_TOKENS, **getattr(config, 'OPENCODE_ZEN_MODEL_CONTEXT_TOKENS', {})}
+    ctx = merged.get(model, config.DEFAULT_CONTEXT_TOKENS)
     return int(ctx * config.PROMPT_CHARS_PER_TOKEN * config.PROMPT_INPUT_BUDGET)
 
 
@@ -552,7 +552,6 @@ def find_best_clips_context(video_path, movie_title, api_key, provider="gemini",
 
     Returns list of {start, end, duration, text, score, title} or None.
     """
-    import json
     import time
     from pathlib import Path
 
@@ -612,6 +611,8 @@ def find_best_clips_context(video_path, movie_title, api_key, provider="gemini",
           f"(model: {model}, ~{total_batches} LLM calls)...")
     batch_start = 0
     for batch_num, batch_blocks in enumerate(batches, 1):
+        print(f"\n  ── Batch {batch_num}/{total_batches} "
+              f"(blocks {batch_start+1}-{batch_start+len(batch_blocks)}) ──")
 
         # Build blocks_text for the combined prompt
         block_texts = []
@@ -650,13 +651,14 @@ def find_best_clips_context(video_path, movie_title, api_key, provider="gemini",
             blocks_text=blocks_text,
         )
 
-        print(f"\n  ── Batch {batch_num}/{total_batches} "
-              f"(blocks {batch_start+1}-{batch_start+len(batch_blocks)}) ──")
+        # T4: adaptive max_tokens
+        def _max_tokens_for(n: int) -> int:
+            return max(4096, min(8192, 4096 * n // 2 + 2048))
 
         # Call LLM once for the entire batch
         raw_response = None
         try:
-            raw_response = call_llm(prompt, api_key, provider, max_tokens=4096)
+            raw_response = call_llm(prompt, api_key, provider, max_tokens=_max_tokens_for(len(batch_blocks)))
         except Exception as e:
             print(f"  ⚠️ Batch {batch_num} LLM failed: {e}")
 
@@ -674,6 +676,64 @@ def find_best_clips_context(video_path, movie_title, api_key, provider="gemini",
                 raw_short = raw_short[:500] + "..."
             print(f"  ⚠️ Batch {batch_num}: LLM returned 0 parsed clips. Raw (truncated):")
             print(f"     {raw_short}")
+
+        # T4: split-retry when null/0-parsed and batch size > 1
+        if (raw_response is None or not batch_clips) and len(batch_blocks) > 1:
+            print(f"  ↻ Batch {batch_num}: null/0-parsed → split-retry ({len(batch_blocks)} blocks)")
+            from collections import deque as _dq
+            merged: dict[int, list[dict]] = {}
+            mid0 = len(batch_blocks) // 2
+            queue = _dq([(batch_blocks[:mid0], 0), (batch_blocks[mid0:], mid0)])
+            while queue:
+                sub_blocks, offset = queue.popleft()
+                # build prompt for sub_blocks
+                sub_texts = []
+                for j, sb in enumerate(sub_blocks):
+                    sb_start = sb["start"]
+                    sb_end = sb["end"]
+                    sb_dur = sb_end - sb_start
+                    dlg = sb.get("text", "").strip() or "(нет диалога)"
+                    cc = sb.get("cut_count", 0)
+                    pp = sb.get("pause_points", [])
+                    if language == "ru":
+                        sub_texts.append(
+                            f"--- БЛОК {j} ({_format_time(sb_start)}-{_format_time(sb_end)}, {sb_dur:.0f}s) ---\n"
+                            f"Диалог: {dlg}\n"
+                            f"Смен кадра: {cc} (высокое = экшн)\n"
+                            f"Паузы в диалоге: {pp}"
+                        )
+                    else:
+                        sub_texts.append(
+                            f"--- BLOCK {j} ({_format_time(sb_start)}-{_format_time(sb_end)}, {sb_dur:.0f}s) ---\n"
+                            f"Dialogue: {dlg}\n"
+                            f"Cut count: {cc} (high = action)\n"
+                            f"Dialogue pauses: {pp}"
+                        )
+                sub_prompt = batch_template.format(movie_name=movie_title, blocks_text="\n\n".join(sub_texts))
+                sub_raw = None
+                try:
+                    sub_raw = call_llm(sub_prompt, api_key, provider, max_tokens=_max_tokens_for(len(sub_blocks)))
+                except Exception as e:
+                    print(f"  ⚠️ Split sub-batch (offset {offset}, size {len(sub_blocks)}) failed: {e}")
+                    sub_raw = None
+                if sub_raw:
+                    sub_starts = [b["start"] for b in sub_blocks]
+                    sub_clips = _parse_batch_response(sub_raw, sub_starts)
+                else:
+                    sub_clips = {}
+                if not sub_clips and len(sub_blocks) > 1:
+                    sm = len(sub_blocks) // 2
+                    queue.append((sub_blocks[:sm], offset))
+                    queue.append((sub_blocks[sm:], offset + sm))
+                    print(f"  ↻ Split sub-batch offset {offset} size {len(sub_blocks)} still empty → split in 2")
+                elif sub_clips:
+                    for k, v in sub_clips.items():
+                        merged.setdefault(k + offset, []).extend(v)
+            if merged:
+                batch_clips = merged
+                print(f"  ✅ Split-retry recovered {sum(len(v) for v in batch_clips.values())} clip(s) for batch {batch_num}")
+            else:
+                print(f"  ⚠️ Split-retry: no clips recovered for batch {batch_num}, fallback will apply")
 
         # Process each block in the batch
         for i, block in enumerate(batch_blocks):
