@@ -2,7 +2,7 @@
 
 **Automatic movie clipping for YouTube Shorts** — intelligently extracts the best moments from full-length movies, crops them to 9:16 vertical format, adds proper subtitles, and prepares them for YouTube Shorts publishing.
 
-> Built with PySceneDetect, faster-whisper, FFmpeg, and LLM scoring (Yandex AI Studio DeepSeek V4 / Gemini).
+> Built with PySceneDetect, faster-whisper, FFmpeg, and LLM scoring (Yandex AI Studio DeepSeek V4 / Gemini / OpenRouter / OpenCode Zen).
 
 ![Status](https://img.shields.io/badge/status-stable-green)
 ![Python](https://img.shields.io/badge/python-3.9%20|%203.10%20|%203.11%20|%203.12%20|%203.13%20|%203.14-3776AB?logo=python&logoColor=white)
@@ -105,6 +105,20 @@ If you find this project useful, you can support it:
 1. Get an API key from [Google AI Studio](https://aistudio.google.com/apikey)
 2. Go to **Settings** > **Gemini** and paste the key
 
+#### OpenRouter
+
+1. Get an API key from [OpenRouter](https://openrouter.ai/keys)
+2. Go to **Settings** in the app → Provider: **OpenRouter**
+3. Enter **API Key**, select model (default `stealth/ox-alpha`)
+4. Click **Verify key**
+
+#### OpenCode Zen
+
+1. Get an API key from [OpenCode Zen](https://opencode.ai/auth)
+2. Go to **Settings** in the app → Provider: **OpenCode Zen**
+3. Enter **API Key**, select model (default `nemotron-3-ultra-free`)
+4. Click **Verify key**
+
 ### Pipeline
 
 1. **Scene detection** — PySceneDetect finds boundaries by frame changes
@@ -127,7 +141,7 @@ If you find this project useful, you can support it:
 
 **MovieShort AI** — автоматическая нарезка фильмов на YouTube Shorts. Интеллектуально извлекает лучшие моменты из полнометражных фильмов, обрезает их в вертикальный формат 9:16, добавляет субтитры и готовит к публикации.
 
-> Сделано с PySceneDetect, faster-whisper, FFmpeg и скорингом через LLM (Yandex AI Studio DeepSeek V4 / Gemini).
+> Сделано с PySceneDetect, faster-whisper, FFmpeg и скорингом через LLM (Yandex AI Studio DeepSeek V4 / Gemini / OpenRouter / OpenCode Zen).
 
 ### Возможности
 
@@ -206,6 +220,20 @@ run.bat
 
 1. Получи ключ: [Google AI Studio](https://aistudio.google.com/apikey)
 2. Вставь API-ключ в **Settings** > **Gemini** — приложение само определит OpenRouter или Google AI
+
+#### OpenRouter
+
+1. Получи ключ: [OpenRouter](https://openrouter.ai/keys)
+2. В интерфейсе: **Settings** → провайдер **OpenRouter**
+3. Введи **API Key**, выбери модель (по умолчанию `stealth/ox-alpha`)
+4. Нажми **Verify key** — зелёный = работает
+
+#### OpenCode Zen
+
+1. Получи ключ: [OpenCode Zen](https://opencode.ai/auth)
+2. В интерфейсе: **Settings** → провайдер **OpenCode Zen**
+3. Введи **API Key**, выбери модель (по умолчанию `nemotron-3-ultra-free`)
+4. Нажми **Verify key** — зелёный = работает
 
 ### Пайплайн обработки
 
