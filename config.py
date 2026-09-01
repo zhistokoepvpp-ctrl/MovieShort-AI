@@ -4,7 +4,7 @@ MovieShort AI — Configuration
 from pathlib import Path
 
 # App version
-APP_VERSION = "2.1"
+APP_VERSION = "2.1.1"
 
 # Paths
 BASE_DIR = Path(__file__).parent
