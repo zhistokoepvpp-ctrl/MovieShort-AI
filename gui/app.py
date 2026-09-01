@@ -854,19 +854,12 @@ async () => {
                     else if(input && input.url) url=String(input.url);
                     if(init && init.body) body=init.body;
                     else if(input && input instanceof Request) { try{ body=input.body; }catch(_){} }
-                    // Gradio 5 may send Request object — try to read body via clone if needed
-                    var isFD=false; try{ isFD=body instanceof FormData || body instanceof Blob || body instanceof ArrayBuffer || (body && body.buffer instanceof ArrayBuffer) || (body && typeof body.entries==='function') || (body && typeof body.arrayBuffer==='function'); }catch(_){}
-                    // Any FormData/Blob/ArrayBuffer = file upload — показываем сразу, независимо от URL (fix: ранее требовался upload в URL)
-                    var isUploadUrl=false;
-                    try{ isUploadUrl=typeof url==='string' && (url.indexOf('upload')!==-1 || url.indexOf('gradio')!==-1 || url.indexOf('predict')!==-1 || url.indexOf('/file')!==-1 || url.indexOf('queue')!==-1); }catch(_){}
-                    if(isFD) isUploadUrl=true;
-                    // Fallback: Gradio 5 может слать Request с ReadableStream/Blob где instanceof не срабатывает — считаем upload по URL+POST
-                    var isUpload=isFD || (isUploadUrl && ( (init&&init.method||'POST')!=='GET' )) || (isUploadUrl && body);
-                    // Если body — это Request/ReadableStream и isFD false, всё равно считаем upload если URL похож
-                    if(isUploadUrl && !isFD && body) isUpload=true;
-                    if(isUploadUrl && !isFD && typeof url==='string' && url.indexOf('upload')!==-1) isUpload=true;
-                    console.log('[upload] fetch intercept', url, 'isFD', isFD, 'isUploadUrl', isUploadUrl, 'isUpload', isUpload);
-                    if(isUpload){
+                    // Перехватываем ТОЛЬКО настоящий FormData (загрузка файла) — у него нужен upload progress.
+                    // Раньше здесь было `|| ArrayBuffer || typeof body.entries==='function'` + URL-фильтр с 'queue'/'predict',
+                    // из-за чего перехватывались ВСЕ POST включая JSON /queue/join → XHR-шим срезал Content-Type → 422 и
+                    // «кнопка не работает». JSON-посты (строка-body) уходят в оригинальный fetch без изменений.
+                    var isFD=false; try{ isFD=(typeof FormData!=='undefined') && (body instanceof FormData); }catch(_){}
+                    if(isFD){
                         var fname=''; try{ if(body && typeof body.entries==='function') fname=_fileNameFromFormData(body); }catch(_){}
                         var targetId=_activeUploadId()||'upload-progress';
                         try{
@@ -901,7 +894,7 @@ async () => {
                             xhr.upload.onprogress=function(ev){ if(ev.lengthComputable) updateBar(Math.round(ev.loaded/ev.total*100)); };
                             xhr.onload=function(){
                                 var headers=new Headers();
-                                try{ var raw=xhr.getAllResponseHeaders()||''; raw.trim().split(/[\r\n]+/).forEach(function(line){ var idx=line.indexOf(':'); if(idx>0) headers.append(line.slice(0,idx).trim(), line.slice(idx+1).trim()); }); }catch(_){}
+                                try{ var raw=xhr.getAllResponseHeaders()||''; raw.trim().split(/[\\r\\n]+/).forEach(function(line){ var idx=line.indexOf(':'); if(idx>0) headers.append(line.slice(0,idx).trim(), line.slice(idx+1).trim()); }); }catch(_){}
                                 var bodyText=xhr.responseText;
                                 // detect filename for Done state
                                 var doneName=fname;
