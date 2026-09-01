@@ -597,6 +597,91 @@ footer { display: none; }
 .gradio-container .wrap .progress {
     display: none !important;
 }
+/* ── FIX: native "Uploading..." — ХОТЯ БЫ нативный индикатор должен быть виден.
+    Ранее был display:none !important на .uploading — теперь force visible fallback.
+    JS скроет его только когда покажет кастомный #upload-progress, иначе остаётся видимым. ── */
+#auto-file .progress, #manual-file .progress,
+#auto-file .file-preview .progress, #manual-file .file-preview .progress { display: none !important; }
+/* native uploading — видимый fallback: block !important + цвет акцента, не конфликтует с кастомом */
+#auto-file .uploading, #manual-file .uploading,
+.gradio-container .uploading,
+.gradio-container span.uploading,
+.gradio-container div.uploading {
+    display: block !important;
+    visibility: visible !important;
+    opacity: 1 !important;
+    color: #D4A27F !important;
+    font-size: 13px !important;
+    font-weight: 600 !important;
+    padding: 6px 0 !important;
+}
+/* when custom progress is active, hide native to avoid duplication (JS toggles .uploading via style) */
+/* ── Upload progress indicator (upload_progress) — visible spinner + bar in #C15F3C ── */
+#upload-progress, #upload-progress-auto {
+    display: none;
+    margin: 8px 0 4px 0;
+    min-height: 0;
+}
+#upload-progress .upload-loading,
+#upload-progress-auto .upload-loading {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 16px;
+    background: rgba(193,95,60,.10);
+    border: 1px solid rgba(204,120,92,.25);
+    border-radius: 12px;
+    color: #F5F4EE;
+    font-size: 13px;
+    font-weight: 500;
+}
+#upload-progress .upload-spinner,
+#upload-progress-auto .upload-spinner {
+    width: 18px;
+    height: 18px;
+    min-width: 18px;
+    border: 2.5px solid rgba(193,95,60,.25);
+    border-top-color: #C15F3C;
+    border-radius: 50%;
+    animation: upload-spin .7s linear infinite;
+}
+#upload-progress .upload-bar-track,
+#upload-progress-auto .upload-bar-track {
+    flex: 1;
+    height: 6px;
+    background: rgba(255,255,255,.08);
+    border-radius: 999px;
+    overflow: hidden;
+}
+#upload-progress .upload-bar-fill,
+#upload-progress-auto .upload-bar-fill {
+    height: 100%;
+    width: var(--pct, 0%);
+    background: linear-gradient(90deg, #C15F3C, #CC785C);
+    border-radius: 999px;
+    transition: width .2s ease;
+}
+#upload-progress .upload-pct,
+#upload-progress-auto .upload-pct {
+    min-width: 38px;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+    font-weight: 700;
+    color: #C15F3C;
+}
+@keyframes upload-spin { to { transform: rotate(360deg); } }
+/* Done state: зелёный чек, тот же контейнер */
+#upload-progress .upload-done,
+#upload-progress-auto .upload-done {
+    background: rgba(34,197,94,.10) !important;
+    border-color: rgba(34,197,94,.30) !important;
+}
+#upload-progress .upload-done .upload-check,
+#upload-progress-auto .upload-done .upload-check {
+    color: #22c55e;
+    font-weight: 700;
+    font-size: 16px;
+}
 """
 
 # Force Gradio's dark palette regardless of OS/browser preference: first run
@@ -690,6 +775,248 @@ async () => {
             }));
         }
     }, { passive: true });
+    // === Upload progress: deterministic 0-100% + fetch→XHR patch for Gradio 5 ===
+    function _escHtml(s){ return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+    function _loadingHtml(name){ var n=_escHtml(name||'файл'); return '<div class="upload-loading"><div class="upload-spinner"></div><span>Загрузка: '+n+' \u2014 </span><span class="upload-pct">5%</span><div class="upload-bar-track"><div class="upload-bar-fill" style="--pct:5%"></div></div></div>'; }
+    function _doneHtml(name){ var n=_escHtml(name||'файл'); return '<div class="upload-loading upload-done"><span>Готово: '+n+' </span><span class="upload-check">\u2713</span></div>'; }
+    function _showProgress(id, html){ var el=document.getElementById(id); if(!el) return; el.innerHTML=html; el.style.setProperty('display','block','important'); el.style.setProperty('visibility','visible','important'); el.style.setProperty('opacity','1','important'); var blk=el.closest('.block'); if(blk) blk.style.setProperty('display','block','important'); el.removeAttribute('hidden'); el.hidden=false; try{ var nat=document.querySelector(id==='upload-progress-auto'?'#auto-file .uploading':'#manual-file .uploading'); if(nat) nat.style.setProperty('display','none','important'); }catch(_){} }
+    function _hideProgress(id){ var el=document.getElementById(id); if(!el) return; el.style.setProperty('display','none','important'); el.innerHTML=''; el.hidden=true; if(el._hideTimer){ clearTimeout(el._hideTimer); el._hideTimer=null; } var curEl=document.getElementById(id); if(curEl && curEl._fakeIv){ clearInterval(curEl._fakeIv); curEl._fakeIv=null; } try{ var nat2=document.querySelector(id==='upload-progress-auto'?'#auto-file .uploading':'#manual-file .uploading'); if(nat2) nat2.style.removeProperty('display'); }catch(_){} }
+    function _showDoneThenHide(id, name){ _showProgress(id,_doneHtml(name)); var el=document.getElementById(id); if(el){ if(el._hideTimer) clearTimeout(el._hideTimer); el._hideTimer=setTimeout(function(){ _hideProgress(id); },1500); } }
+    // initial hide — только если innerHTML пустой, иначе не трогать (фикс: 200мс снова скрывал после visible=True + drop)
+    (function(){
+        ['upload-progress','upload-progress-auto'].forEach(function(id){
+            var el=document.getElementById(id);
+            if(el && (!el.innerHTML || el.innerHTML.trim()==='')) _hideProgress(id);
+            else if(el){ el.style.setProperty('display','block','important'); el.style.setProperty('visibility','visible','important'); }
+        });
+    })();
+    setTimeout(function(){
+        ['upload-progress','upload-progress-auto'].forEach(function(id){
+            var el=document.getElementById(id);
+            if(el && (!el.innerHTML || el.innerHTML.trim()==='')) _hideProgress(id);
+        });
+    }, 800);
+    function _targetToId(target){
+        if(!target||!target.closest) return null;
+        if(target.closest('#manual-file')) return 'upload-progress';
+        if(target.closest('#auto-file')) return 'upload-progress-auto';
+        if(target.closest('.film-upload-manual')) return 'upload-progress';
+        if(target.closest('.film-upload-auto')) return 'upload-progress-auto';
+        if(target.closest('.film-upload')) {
+            var man=document.getElementById('manual-file'); var aut=document.getElementById('auto-file');
+            var manVis=man && man.offsetParent!==null; var autVis=aut && aut.offsetParent!==null;
+            if(manVis && !autVis) return 'upload-progress';
+            if(!manVis && autVis) return 'upload-progress-auto';
+            return 'upload-progress';
+        }
+        return null;
+    }
+    function _activeUploadId(){
+        var a=document.getElementById('upload-progress'); if(a && a.style.display!=='none' && a.innerHTML.indexOf('upload-loading')!==-1 && a.innerHTML.indexOf('upload-done')===-1) return 'upload-progress';
+        var b=document.getElementById('upload-progress-auto'); if(b && b.style.display!=='none' && b.innerHTML.indexOf('upload-loading')!==-1 && b.innerHTML.indexOf('upload-done')===-1) return 'upload-progress-auto';
+        return null;
+    }
+    function updateBar(pct){
+        pct=Math.max(0,Math.min(100,Math.round(pct)));
+        var id=_activeUploadId();
+        var ids=id?[id]:['upload-progress','upload-progress-auto'];
+        ids.forEach(function(i){
+            var el=document.getElementById(i);
+            if(!el) return;
+            // FIX: previously `if(display==='none') return` блокировал обновление когда скрыто -> вечно 5%.
+            // Теперь если скрыто и pct>0 — сначала показать, затем обновить.
+            if(el.style.display==='none' || el.innerHTML==='' || el.innerHTML.indexOf('upload-loading')===-1){
+                if(pct>0 && el.innerHTML.indexOf('upload-done')===-1){
+                    _showProgress(i, _loadingHtml('файл'));
+                    el=document.getElementById(i);
+                    if(!el) return;
+                } else return;
+            }
+            if(el.innerHTML.indexOf('upload-done')!==-1) return;
+            var fill=el.querySelector('.upload-bar-fill'); if(fill) fill.style.setProperty('--pct',pct+'%');
+            var pctEl=el.querySelector('.upload-pct'); if(pctEl) pctEl.textContent=pct+'%';
+        });
+    }
+    function _fileNameFromFormData(fd){
+        try{ if(!fd||typeof fd.entries!=='function') return ''; for(var p of fd.entries()){ var v=p[1]; if(v instanceof File) return v.name; if(v && v.name) return v.name; } }catch(_){}
+        return '';
+    }
+    // intercept fetch for FormData uploads -> XHR with progress
+    try{
+        (function(){
+            var origFetch=window.fetch;
+            if(!origFetch || origFetch._patchedUpload) return;
+            window.fetch=function(input, init){
+                try{
+                    var url=''; var body=null;
+                    if(typeof input==='string') url=input;
+                    else if(input && typeof input.url==='string') url=input.url;
+                    else if(input && input.url) url=String(input.url);
+                    if(init && init.body) body=init.body;
+                    else if(input && input instanceof Request) { try{ body=input.body; }catch(_){} }
+                    // Gradio 5 may send Request object — try to read body via clone if needed
+                    var isFD=false; try{ isFD=body instanceof FormData || body instanceof Blob || body instanceof ArrayBuffer || (body && body.buffer instanceof ArrayBuffer) || (body && typeof body.entries==='function') || (body && typeof body.arrayBuffer==='function'); }catch(_){}
+                    // Any FormData/Blob/ArrayBuffer = file upload — показываем сразу, независимо от URL (fix: ранее требовался upload в URL)
+                    var isUploadUrl=false;
+                    try{ isUploadUrl=typeof url==='string' && (url.indexOf('upload')!==-1 || url.indexOf('gradio')!==-1 || url.indexOf('predict')!==-1 || url.indexOf('/file')!==-1 || url.indexOf('queue')!==-1); }catch(_){}
+                    if(isFD) isUploadUrl=true;
+                    // Fallback: Gradio 5 может слать Request с ReadableStream/Blob где instanceof не срабатывает — считаем upload по URL+POST
+                    var isUpload=isFD || (isUploadUrl && ( (init&&init.method||'POST')!=='GET' )) || (isUploadUrl && body);
+                    // Если body — это Request/ReadableStream и isFD false, всё равно считаем upload если URL похож
+                    if(isUploadUrl && !isFD && body) isUpload=true;
+                    if(isUploadUrl && !isFD && typeof url==='string' && url.indexOf('upload')!==-1) isUpload=true;
+                    console.log('[upload] fetch intercept', url, 'isFD', isFD, 'isUploadUrl', isUploadUrl, 'isUpload', isUpload);
+                    if(isUpload){
+                        var fname=''; try{ if(body && typeof body.entries==='function') fname=_fileNameFromFormData(body); }catch(_){}
+                        var targetId=_activeUploadId()||'upload-progress';
+                        try{
+                            var ae=document.activeElement;
+                            var inferred=_targetToId(ae);
+                            if(inferred) targetId=inferred;
+                            else if(document.querySelector('#auto-file input:focus')) targetId='upload-progress-auto';
+                            else {
+                                // fallback: visible tab heuristic
+                                var man=document.getElementById('manual-file'); var aut=document.getElementById('auto-file');
+                                var manVis=man && man.offsetParent!==null; var autVis=aut && aut.offsetParent!==null;
+                                if(!manVis && autVis) targetId='upload-progress-auto';
+                            }
+                        }catch(_){}
+                        console.log('[upload] fetch show', targetId, fname);
+                        var el=document.getElementById(targetId);
+                        if(!el || el.style.display==='none' || el.innerHTML==='') _showProgress(targetId,_loadingHtml(fname||'файл'));
+                        // if both tabs hidden, show in manual by default, auto fetch will correct via _activeUploadId after first progress
+                        return new Promise(function(resolve,reject){
+                            var xhr=new XMLHttpRequest();
+                            xhr.open((init&&init.method)||'POST', url, true);
+                            try{
+                                if(init&&init.headers){
+                                    var h=init.headers;
+                                    if(h instanceof Headers){ h.forEach(function(v,k){ if(k.toLowerCase()!=='content-type') xhr.setRequestHeader(k,v); }); }
+                                    else if(typeof h==='object'){ Object.keys(h).forEach(function(k){ if(k.toLowerCase()!=='content-type') xhr.setRequestHeader(k,h[k]); }); }
+                                }
+                            }catch(_){}
+                            if(init&&init.signal){
+                                try{ init.signal.addEventListener('abort',function(){ try{xhr.abort();}catch(_){}}); }catch(_){}
+                            }
+                            xhr.upload.onprogress=function(ev){ if(ev.lengthComputable) updateBar(Math.round(ev.loaded/ev.total*100)); };
+                            xhr.onload=function(){
+                                var headers=new Headers();
+                                try{ var raw=xhr.getAllResponseHeaders()||''; raw.trim().split(/[\r\n]+/).forEach(function(line){ var idx=line.indexOf(':'); if(idx>0) headers.append(line.slice(0,idx).trim(), line.slice(idx+1).trim()); }); }catch(_){}
+                                var bodyText=xhr.responseText;
+                                // detect filename for Done state
+                                var doneName=fname;
+                                updateBar(100);
+                                var doneId=_activeUploadId()||targetId;
+                                _showDoneThenHide(doneId, doneName||'файл');
+                                resolve(new Response(bodyText,{status:xhr.status,statusText:xhr.statusText,headers:headers}));
+                            };
+                            xhr.onerror=function(){ reject(new TypeError('Network request failed')); };
+                            xhr.onabort=function(){ reject(new DOMException('Aborted','AbortError')); };
+                            xhr.send(body);
+                        });
+                    }
+                }catch(e){ /* fall through to orig fetch */ }
+                return origFetch.apply(this, arguments);
+            };
+            window.fetch._patchedUpload=true;
+        })();
+    }catch(_){}
+    // drop shows bar immediately (fetch patch drives 0->100%); fallback if target detection fails
+    document.addEventListener('drop', function(e){
+        console.log('[upload] drop', e.target && e.target.id, e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length);
+        var dt=e.dataTransfer; var hasFiles=false; var name='';
+        try{
+            if(dt){
+                if(dt.files && dt.files[0] && dt.files[0].name){ hasFiles=true; name=dt.files[0].name; }
+                else if(dt.items && dt.items[0]){
+                    try{ var f=dt.items[0].getAsFile && dt.items[0].getAsFile(); if(f && f.name){ hasFiles=true; name=f.name; } else if(dt.items[0].kind==='file') hasFiles=true; }catch(_){}
+                    if(!name && dt.items[0].getAsFile) try{ var ff=dt.items[0].getAsFile(); if(ff) name=ff.name; }catch(_){}
+                }
+                // even if no file detected, still show generic if drop occurred on upload area
+                if(!hasFiles && dt.files) hasFiles=dt.files.length>0;
+                if(!hasFiles && dt.items) hasFiles=dt.items.length>0;
+            }
+        }catch(_){}
+        // always show — even generic "файл" if name missing, never early return
+        var id=_targetToId(e.target);
+        if(!id){
+            var man=document.getElementById('manual-file'); var auto=document.getElementById('auto-file');
+            var manVis=man && man.offsetParent!==null; var autoVis=auto && auto.offsetParent!==null;
+            if(manVis && !autoVis) id='upload-progress';
+            else if(!manVis && autoVis) id='upload-progress-auto';
+            else id='upload-progress';
+        }
+        console.log('[upload] drop resolved', id, name || 'файл');
+        var el=document.getElementById(id);
+        if(el && el.style.display!=='none' && el.innerHTML.indexOf('upload-loading')!==-1 && el.innerHTML.indexOf('upload-done')===-1) return;
+        if(!name) name='файл';
+        _showProgress(id, _loadingHtml(name));
+        setTimeout(function(){ var curEl=document.getElementById(id); if(curEl && curEl.querySelector('.upload-pct') && curEl.querySelector('.upload-pct').textContent==='5%'){ var fake=10; var iv=setInterval(function(){ if(!curEl || curEl.style.display==='none' || curEl.innerHTML.indexOf('upload-done')!==-1){ clearInterval(iv); return; } fake+=5; if(fake>=90){ clearInterval(iv); fake=90; } var f=curEl.querySelector('.upload-bar-fill'); if(f) f.style.setProperty('--pct',fake+'%'); var pe=curEl.querySelector('.upload-pct'); if(pe) pe.textContent=fake+'%'; }, 200); curEl._fakeIv=iv; } }, 400);
+    }, true);
+    // change handler intentionally NOT showing loading — fetch patch already shows; only handles Done path via Python fallback
+    // auto-hide Done after 1.5s (Python renders Done html, JS hides)
+    setInterval(function(){
+        ['upload-progress','upload-progress-auto'].forEach(function(id){
+            var el=document.getElementById(id);
+            if(el && el.innerHTML.indexOf('upload-done')!==-1 && !el._hideTimer){
+                el._hideTimer=setTimeout(function(){ _hideProgress(id); },1500);
+            }
+        });
+    }, 300);
+    // fallback: if file already appears in Gradio component but progress still shows Loading (Python change missed), transition to Done
+    setInterval(function(){
+        [['manual-file','upload-progress'],['auto-file','upload-progress-auto']].forEach(function(pair){
+            var fid=pair[0], pid=pair[1];
+            var fileEl=document.getElementById(fid);
+            var progEl=document.getElementById(pid);
+            if(!fileEl||!progEl||progEl.style.display==='none') return;
+            if(progEl.innerHTML.indexOf('upload-loading')===-1 || progEl.innerHTML.indexOf('upload-done')!==-1) return;
+            var hasFile=false; try{ var txt=fileEl.textContent||''; hasFile=txt.indexOf('.avi')!==-1||txt.indexOf('.mp4')!==-1||txt.indexOf('.mkv')!==-1||txt.indexOf('.mov')!==-1||fileEl.querySelector('.file-preview')||fileEl.querySelector('a[href*=\"gradio\"]'); }catch(_){}
+            if(hasFile){
+                var nm='файл'; try{ var m=(fileEl.textContent||'').match(/[^\\s]+\\.(avi|mp4|mkv|mov)/i); if(m) nm=m[0].trim(); }catch(_){}
+                if(progEl._fakeIv){ clearInterval(progEl._fakeIv); progEl._fakeIv=null; }
+                _showDoneThenHide(pid, nm);
+            }
+        });
+    }, 500);
+    // legacy XHR hook — keep for non-fetch uploads, route through updateBar
+    try{
+        (function(){
+            var openOrig=XMLHttpRequest.prototype.open;
+            var sendOrig=XMLHttpRequest.prototype.send;
+            XMLHttpRequest.prototype.open=function(m,u){ this._uploadUrl=u; return openOrig.apply(this, arguments); };
+            XMLHttpRequest.prototype.send=function(body){
+                try{
+                    // FIX: показывать _showProgress при любом FormData/Blob/ArrayBuffer — fallback по URL даже если тип не определился
+                    var isUpload=false;
+                    try{ isUpload=(body instanceof FormData || body instanceof Blob || body instanceof ArrayBuffer || (body && body.buffer instanceof ArrayBuffer) || (body && typeof body.entries==='function') || (body && typeof body.arrayBuffer==='function')); }catch(_){}
+                    try{ if(!isUpload && this._uploadUrl && typeof this._uploadUrl==='string' && this._uploadUrl.indexOf('upload')!==-1 && body) isUpload=true; }catch(_){}
+                    try{ if(!isUpload && this._uploadUrl && body && typeof body==='object') isUpload=true; }catch(_){}
+                    if(isUpload){
+                        var fname=''; try{ if(body && typeof body.entries==='function') fname=_fileNameFromFormData(body); }catch(_){}
+                        var targetId=_activeUploadId()||'upload-progress';
+                        try{
+                            var ae=document.activeElement; var inf=_targetToId(ae);
+                            if(inf) targetId=inf;
+                            else if(document.querySelector('#auto-file input:focus')) targetId='upload-progress-auto';
+                            else {
+                                var man=document.getElementById('manual-file'); var aut=document.getElementById('auto-file');
+                                var manVis=man && man.offsetParent!==null; var autVis=aut && aut.offsetParent!==null;
+                                if(!manVis && autVis) targetId='upload-progress-auto';
+                            }
+                        }catch(_){}
+                        var el2=document.getElementById(targetId); if(!el2 || el2.style.display==='none' || el2.innerHTML==='') _showProgress(targetId, _loadingHtml(fname||'файл'));
+                        console.log('[upload] XHR send', targetId, fname);
+                        // use addEventListener to not clobber Gradio's own handler
+                        try{ this.upload.addEventListener('progress', function(ev){ if(ev.lengthComputable) updateBar(Math.round(ev.loaded/ev.total*100)); }); }catch(_){ try{ this.upload.onprogress=function(ev){ if(ev.lengthComputable) updateBar(Math.round(ev.loaded/ev.total*100)); }; }catch(_){} }
+                        var _body=body; var _tid=targetId; var _fname=fname;
+                        this.addEventListener('load', function(){ updateBar(100); var doneId=_activeUploadId()||_tid; if(doneId){ var nm=''; try{ if(_body && typeof _body.entries==='function'){ nm=_fileNameFromFormData(_body); } }catch(_){} _showDoneThenHide(doneId, nm||_fname||'файл'); } });
+                    }
+                }catch(_){}
+                return sendOrig.apply(this, arguments);
+            };
+        })();
+    }catch(_){}
 }
 """
 
@@ -1307,7 +1634,10 @@ def create_app() -> gr.Blocks:
                 video_file = gr.File(
                     label=_t("file_label", ui_lang) + _t("file_label_suffix", ui_lang),
                     file_types=[".mp4", ".avi", ".mkv", ".mov"],
+                    elem_id="manual-file",
+                    elem_classes="film-upload film-upload-manual",
                 )
+                upload_progress = gr.HTML(value="", visible=True, elem_id="upload-progress")
                 # Progressive timecode ranges (todo 22): ONE field per interval
                 # "HH:MM:SS - HH:MM:SS"; field N+1 appears once field N carries
                 # all 12 digits; client JS masks digits and autofocuses the
@@ -1332,6 +1662,30 @@ def create_app() -> gr.Blocks:
                     tc_boxes[_i].change(
                         fn=_tc_reveal, inputs=tc_boxes[_i],
                         outputs=tc_boxes[_i + 1])
+
+                # Upload progress: изолировано по вкладкам, имя файла + Done 1.5с
+                def _esc_html(s):
+                    return (s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+                UPLOAD_LOADING_HTML = '<div class="upload-loading"><div class="upload-spinner"></div><span>Загрузка: файл \u2014 </span><span class="upload-pct">0%</span><div class="upload-bar-track"><div class="upload-bar-fill" style="--pct:0%"></div></div></div>'
+                def _on_manual_upload(f):
+                    if f is None:
+                        return gr.update(value="", visible=False)
+                    try:
+                        name = os.path.basename(f.name) if hasattr(f, 'name') and f.name else "файл"
+                    except Exception:
+                        name = "файл"
+                    esc = _esc_html(name)
+                    done_html = f'<div class="upload-loading upload-done"><span>Готово: {esc} </span><span class="upload-check">\u2713</span></div>'
+                    return gr.update(value=done_html, visible=True)
+                def _on_manual_upload_show():
+                    return gr.update(value=UPLOAD_LOADING_HTML, visible=True)
+                # upload срабатывает в начале копирования в Temp/gradio; change — после завершения
+                try:
+                    video_file.upload(fn=_on_manual_upload_show, inputs=None, outputs=upload_progress)
+                except Exception:
+                    pass
+                video_file.change(fn=_on_manual_upload, inputs=video_file, outputs=upload_progress)
+                video_file.clear(fn=lambda: gr.update(value="", visible=False), outputs=upload_progress)
                 with gr.Group():
                     gr.Markdown(f"### {_t('processing_opts', ui_lang)}")
                     m_subs = gr.Checkbox(value=cfg.get("subtitles", True),
@@ -1510,7 +1864,30 @@ def create_app() -> gr.Blocks:
                 auto_file = gr.File(
                     label=_t("file_label", ui_lang) + _t("file_label_suffix", ui_lang),
                     file_count="single",
+                    elem_id="auto-file",
+                    elem_classes="film-upload film-upload-auto",
                 )
+                auto_upload_progress = gr.HTML(value="", visible=True, elem_id="upload-progress-auto")
+
+                AUTO_LOADING_HTML = '<div class="upload-loading"><div class="upload-spinner"></div><span>Загрузка: файл \u2014 </span><span class="upload-pct">0%</span><div class="upload-bar-track"><div class="upload-bar-fill" style="--pct:0%"></div></div></div>'
+                def _on_auto_upload(f):
+                    if f is None:
+                        return gr.update(value="", visible=False)
+                    try:
+                        name = os.path.basename(f.name) if hasattr(f, 'name') and f.name else "файл"
+                    except Exception:
+                        name = "файл"
+                    esc = _esc_html(name)
+                    done_html = f'<div class="upload-loading upload-done"><span>Готово: {esc} </span><span class="upload-check">\u2713</span></div>'
+                    return gr.update(value=done_html, visible=True)
+                def _on_auto_upload_show():
+                    return gr.update(value=AUTO_LOADING_HTML, visible=True)
+                try:
+                    auto_file.upload(fn=_on_auto_upload_show, inputs=None, outputs=auto_upload_progress)
+                except Exception:
+                    pass
+                auto_file.change(fn=_on_auto_upload, inputs=auto_file, outputs=auto_upload_progress)
+                auto_file.clear(fn=lambda: gr.update(value="", visible=False), outputs=auto_upload_progress)
                 with gr.Row():
                     movie_title_box = gr.Textbox(
                         label=_t("movie_title", ui_lang),
@@ -1547,7 +1924,7 @@ def create_app() -> gr.Blocks:
                     fn=_add_to_queue,
                     inputs=[queue_state, auto_file, movie_title_box],
                     outputs=[queue_state, queue_display, auto_file, movie_title_box],
-                )
+                ).then(fn=lambda: gr.update(value="", visible=False), inputs=[], outputs=[auto_upload_progress])
                 llm_provider = gr.Radio(
                     choices=["Gemini", "Yandex", "OpenRouter", "OpenCode Zen"],
                     value={"gemini": "Gemini", "yandex": "Yandex", "openrouter": "OpenRouter", "opencode_zen": "OpenCode Zen"}.get(
