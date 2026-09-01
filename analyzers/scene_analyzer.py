@@ -182,11 +182,17 @@ def detect_scenes(video_path, threshold=None):
 
     done_flag = False
 
-    def progress_callback(frame: "np.ndarray", frame_number: int) -> None:
+    def progress_callback(frame: "np.ndarray", frame_number) -> None:
         nonlocal start_time, CHECK_INTERVAL, frames_to_process, done_flag
-        if frame_number % CHECK_INTERVAL == 0 and frame_number > 0:
+        # scenedetect 0.7.x passes a FrameTimecode here (0.6.x passes int);
+        # FrameTimecode % int raises TypeError — coerce to plain int first.
+        try:
+            frame_num = int(frame_number)
+        except (TypeError, ValueError):
+            return
+        if frame_num % CHECK_INTERVAL == 0 and frame_num > 0:
             elapsed = time_module.time() - start_time
-            frames_done = min(frame_number, frames_to_process)
+            frames_done = min(frame_num, frames_to_process)
             pct = min(100.0, frames_done / frames_to_process * 100)
             # Skip if already at 100% (avoids repeated prints when estimate is exceeded)
             if pct >= 100.0 and done_flag:
